@@ -27,7 +27,7 @@ const (
 	CertificateFieldRemoved                 = "removed"
 	CertificateFieldSerialNumber            = "serialNumber"
 	CertificateFieldSubjectAlternativeNames = "subjectAlternativeNames"
-	CertificateFieldUuid                    = "uuid"
+	CertificateFieldUUID                    = "uuid"
 	CertificateFieldVersion                 = "version"
 )
 
@@ -54,9 +54,10 @@ type Certificate struct {
 	Removed                 string            `json:"removed,omitempty" yaml:"removed,omitempty"`
 	SerialNumber            string            `json:"serialNumber,omitempty" yaml:"serialNumber,omitempty"`
 	SubjectAlternativeNames []string          `json:"subjectAlternativeNames,omitempty" yaml:"subjectAlternativeNames,omitempty"`
-	Uuid                    string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                    string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 	Version                 string            `json:"version,omitempty" yaml:"version,omitempty"`
 }
+
 type CertificateCollection struct {
 	types.Collection
 	Data   []Certificate `json:"data,omitempty"`
@@ -69,8 +70,10 @@ type CertificateClient struct {
 
 type CertificateOperations interface {
 	List(opts *types.ListOpts) (*CertificateCollection, error)
+	ListAll(opts *types.ListOpts) (*CertificateCollection, error)
 	Create(opts *Certificate) (*Certificate, error)
 	Update(existing *Certificate, updates interface{}) (*Certificate, error)
+	Replace(existing *Certificate) (*Certificate, error)
 	ByID(id string) (*Certificate, error)
 	Delete(container *Certificate) error
 }
@@ -93,10 +96,34 @@ func (c *CertificateClient) Update(existing *Certificate, updates interface{}) (
 	return resp, err
 }
 
+func (c *CertificateClient) Replace(obj *Certificate) (*Certificate, error) {
+	resp := &Certificate{}
+	err := c.apiClient.Ops.DoReplace(CertificateType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *CertificateClient) List(opts *types.ListOpts) (*CertificateCollection, error) {
 	resp := &CertificateCollection{}
 	err := c.apiClient.Ops.DoList(CertificateType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *CertificateClient) ListAll(opts *types.ListOpts) (*CertificateCollection, error) {
+	resp := &CertificateCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

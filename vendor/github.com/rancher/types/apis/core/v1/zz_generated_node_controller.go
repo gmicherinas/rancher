@@ -2,15 +2,18 @@ package v1
 
 import (
 	"context"
+	"time"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
-	"k8s.io/api/core/v1"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/resource"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
@@ -27,15 +30,34 @@ var (
 		Namespaced:   false,
 		Kind:         NodeGroupVersionKind.Kind,
 	}
+
+	NodeGroupVersionResource = schema.GroupVersionResource{
+		Group:    GroupName,
+		Version:  Version,
+		Resource: "nodes",
+	}
 )
+
+func init() {
+	resource.Put(NodeGroupVersionResource)
+}
+
+func NewNode(namespace, name string, obj v1.Node) *v1.Node {
+	obj.APIVersion, obj.Kind = NodeGroupVersionKind.ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
 
 type NodeList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []v1.Node
+	Items           []v1.Node `json:"items"`
 }
 
-type NodeHandlerFunc func(key string, obj *v1.Node) error
+type NodeHandlerFunc func(key string, obj *v1.Node) (runtime.Object, error)
+
+type NodeChangeHandlerFunc func(obj *v1.Node) (runtime.Object, error)
 
 type NodeLister interface {
 	List(namespace string, selector labels.Selector) (ret []*v1.Node, err error)
@@ -43,17 +65,21 @@ type NodeLister interface {
 }
 
 type NodeController interface {
+	Generic() controller.GenericController
 	Informer() cache.SharedIndexInformer
 	Lister() NodeLister
-	AddHandler(name string, handler NodeHandlerFunc)
-	AddClusterScopedHandler(name, clusterName string, handler NodeHandlerFunc)
+	AddHandler(ctx context.Context, name string, handler NodeHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync NodeHandlerFunc)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, handler NodeHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, handler NodeHandlerFunc)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, after time.Duration)
 	Sync(ctx context.Context) error
 	Start(ctx context.Context, threadiness int) error
 }
 
 type NodeInterface interface {
-	ObjectClient() *clientbase.ObjectClient
+	ObjectClient() *objectclient.ObjectClient
 	Create(*v1.Node) (*v1.Node, error)
 	GetNamespaced(namespace, name string, opts metav1.GetOptions) (*v1.Node, error)
 	Get(name string, opts metav1.GetOptions) (*v1.Node, error)
@@ -61,13 +87,18 @@ type NodeInterface interface {
 	Delete(name string, options *metav1.DeleteOptions) error
 	DeleteNamespaced(namespace, name string, options *metav1.DeleteOptions) error
 	List(opts metav1.ListOptions) (*NodeList, error)
+	ListNamespaced(namespace string, opts metav1.ListOptions) (*NodeList, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts metav1.ListOptions) error
 	Controller() NodeController
-	AddHandler(name string, sync NodeHandlerFunc)
-	AddLifecycle(name string, lifecycle NodeLifecycle)
-	AddClusterScopedHandler(name, clusterName string, sync NodeHandlerFunc)
-	AddClusterScopedLifecycle(name, clusterName string, lifecycle NodeLifecycle)
+	AddHandler(ctx context.Context, name string, sync NodeHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync NodeHandlerFunc)
+	AddLifecycle(ctx context.Context, name string, lifecycle NodeLifecycle)
+	AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle NodeLifecycle)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync NodeHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync NodeHandlerFunc)
+	AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle NodeLifecycle)
+	AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle NodeLifecycle)
 }
 
 type nodeLister struct {
@@ -96,7 +127,7 @@ func (l *nodeLister) Get(namespace, name string) (*v1.Node, error) {
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    NodeGroupVersionKind.Group,
 			Resource: "node",
-		}, name)
+		}, key)
 	}
 	return obj.(*v1.Node), nil
 }
@@ -105,40 +136,65 @@ type nodeController struct {
 	controller.GenericController
 }
 
+func (c *nodeController) Generic() controller.GenericController {
+	return c.GenericController
+}
+
 func (c *nodeController) Lister() NodeLister {
 	return &nodeLister{
 		controller: c,
 	}
 }
 
-func (c *nodeController) AddHandler(name string, handler NodeHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *nodeController) AddHandler(ctx context.Context, name string, handler NodeHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Node); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
-		return handler(key, obj.(*v1.Node))
 	})
 }
 
-func (c *nodeController) AddClusterScopedHandler(name, cluster string, handler NodeHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *nodeController) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, handler NodeHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Node); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		if !controller.ObjectInCluster(cluster, obj) {
-			return nil
+func (c *nodeController) AddClusterScopedHandler(ctx context.Context, name, cluster string, handler NodeHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Node); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		return handler(key, obj.(*v1.Node))
+func (c *nodeController) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, cluster string, handler NodeHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Node); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
+		}
 	})
 }
 
@@ -178,11 +234,11 @@ func (s *nodeClient) Controller() NodeController {
 type nodeClient struct {
 	client       *Client
 	ns           string
-	objectClient *clientbase.ObjectClient
+	objectClient *objectclient.ObjectClient
 	controller   NodeController
 }
 
-func (s *nodeClient) ObjectClient() *clientbase.ObjectClient {
+func (s *nodeClient) ObjectClient() *objectclient.ObjectClient {
 	return s.objectClient
 }
 
@@ -219,13 +275,18 @@ func (s *nodeClient) List(opts metav1.ListOptions) (*NodeList, error) {
 	return obj.(*NodeList), err
 }
 
+func (s *nodeClient) ListNamespaced(namespace string, opts metav1.ListOptions) (*NodeList, error) {
+	obj, err := s.objectClient.ListNamespaced(namespace, opts)
+	return obj.(*NodeList), err
+}
+
 func (s *nodeClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	return s.objectClient.Watch(opts)
 }
 
 // Patch applies the patch and returns the patched deployment.
-func (s *nodeClient) Patch(o *v1.Node, data []byte, subresources ...string) (*v1.Node, error) {
-	obj, err := s.objectClient.Patch(o.Name, o, data, subresources...)
+func (s *nodeClient) Patch(o *v1.Node, patchType types.PatchType, data []byte, subresources ...string) (*v1.Node, error) {
+	obj, err := s.objectClient.Patch(o.Name, o, patchType, data, subresources...)
 	return obj.(*v1.Node), err
 }
 
@@ -233,20 +294,38 @@ func (s *nodeClient) DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts
 	return s.objectClient.DeleteCollection(deleteOpts, listOpts)
 }
 
-func (s *nodeClient) AddHandler(name string, sync NodeHandlerFunc) {
-	s.Controller().AddHandler(name, sync)
+func (s *nodeClient) AddHandler(ctx context.Context, name string, sync NodeHandlerFunc) {
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *nodeClient) AddLifecycle(name string, lifecycle NodeLifecycle) {
+func (s *nodeClient) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync NodeHandlerFunc) {
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
+}
+
+func (s *nodeClient) AddLifecycle(ctx context.Context, name string, lifecycle NodeLifecycle) {
 	sync := NewNodeLifecycleAdapter(name, false, s, lifecycle)
-	s.AddHandler(name, sync)
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *nodeClient) AddClusterScopedHandler(name, clusterName string, sync NodeHandlerFunc) {
-	s.Controller().AddClusterScopedHandler(name, clusterName, sync)
+func (s *nodeClient) AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle NodeLifecycle) {
+	sync := NewNodeLifecycleAdapter(name, false, s, lifecycle)
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
 }
 
-func (s *nodeClient) AddClusterScopedLifecycle(name, clusterName string, lifecycle NodeLifecycle) {
+func (s *nodeClient) AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync NodeHandlerFunc) {
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *nodeClient) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync NodeHandlerFunc) {
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
+}
+
+func (s *nodeClient) AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle NodeLifecycle) {
 	sync := NewNodeLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
-	s.AddClusterScopedHandler(name, clusterName, sync)
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *nodeClient) AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle NodeLifecycle) {
+	sync := NewNodeLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
 }

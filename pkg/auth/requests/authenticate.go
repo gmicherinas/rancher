@@ -2,18 +2,19 @@ package requests
 
 import (
 	"context"
-	"net/http"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
-
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/rancher/rancher/pkg/auth/tokens"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/clusterrouter"
+	"github.com/rancher/steve/pkg/auth"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/client-go/tools/cache"
 )
 
 type Authenticator interface {
@@ -21,21 +22,39 @@ type Authenticator interface {
 	TokenFromRequest(req *http.Request) (*v3.Token, error)
 }
 
+func ToAuthMiddleware(a Authenticator) auth.Middleware {
+	f := func(req *http.Request) (user.Info, bool, error) {
+		authed, u, groups, err := a.Authenticate(req)
+		return &user.DefaultInfo{
+			Name:   u,
+			UID:    u,
+			Groups: groups,
+		}, authed, err
+	}
+	return auth.ToMiddleware(auth.AuthenticatorFunc(f))
+}
+
 func NewAuthenticator(ctx context.Context, mgmtCtx *config.ScaledContext) Authenticator {
 	tokenInformer := mgmtCtx.Management.Tokens("").Controller().Informer()
 	tokenInformer.AddIndexers(map[string]cache.IndexFunc{tokenKeyIndex: tokenKeyIndexer})
 
 	return &tokenAuthenticator{
-		ctx:          ctx,
-		tokenIndexer: tokenInformer.GetIndexer(),
-		tokenClient:  mgmtCtx.Management.Tokens(""),
+		ctx:                 ctx,
+		tokenIndexer:        tokenInformer.GetIndexer(),
+		tokenClient:         mgmtCtx.Management.Tokens(""),
+		userAttributeLister: mgmtCtx.Management.UserAttributes("").Controller().Lister(),
+		userAttributes:      mgmtCtx.Management.UserAttributes(""),
+		userLister:          mgmtCtx.Management.Users("").Controller().Lister(),
 	}
 }
 
 type tokenAuthenticator struct {
-	ctx          context.Context
-	tokenIndexer cache.Indexer
-	tokenClient  v3.TokenInterface
+	ctx                 context.Context
+	tokenIndexer        cache.Indexer
+	tokenClient         v3.TokenInterface
+	userAttributes      v3.UserAttributeInterface
+	userAttributeLister v3.UserAttributeLister
+	userLister          v3.UserLister
 }
 
 const (
@@ -57,12 +76,51 @@ func (a *tokenAuthenticator) Authenticate(req *http.Request) (bool, string, []st
 		return false, "", []string{}, err
 	}
 
-	var groups []string
-	for _, principal := range token.GroupPrincipals {
-		// TODO This is a short cut for now. Will actually need to lookup groups in future
-		name := strings.TrimPrefix(principal.Name, "local://")
-		groups = append(groups, name)
+	if token.Enabled != nil && !*token.Enabled {
+		return false, "", []string{}, fmt.Errorf("user's token is not enabled")
 	}
+	if token.ClusterName != "" && token.ClusterName != clusterrouter.GetClusterID(req) {
+		return false, "", []string{}, fmt.Errorf("clusterID does not match")
+	}
+
+	attribs, err := a.userAttributeLister.Get("", token.UserID)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return false, "", []string{}, err
+	}
+
+	u, err := a.userLister.Get("", token.UserID)
+	if err != nil {
+		return false, "", []string{}, err
+	}
+
+	if u.Enabled != nil && !*u.Enabled {
+		return false, "", []string{}, fmt.Errorf("user is not enabled")
+	}
+
+	var groups []string
+	hitProvider := false
+	if attribs != nil {
+		for provider, gps := range attribs.GroupPrincipals {
+			if provider == token.AuthProvider {
+				hitProvider = true
+			}
+			for _, principal := range gps.Items {
+				name := strings.TrimPrefix(principal.Name, "local://")
+				groups = append(groups, name)
+			}
+		}
+	}
+
+	// fallback to legacy token.GroupPrincipals
+	if !hitProvider {
+		for _, principal := range token.GroupPrincipals {
+			// TODO This is a short cut for now. Will actually need to lookup groups in future
+			name := strings.TrimPrefix(principal.Name, "local://")
+			groups = append(groups, name)
+		}
+	}
+
+	groups = append(groups, user.AllAuthenticated, "system:cattle:authenticated")
 
 	return true, token.UserID, groups, nil
 }
@@ -102,13 +160,8 @@ func (a *tokenAuthenticator) TokenFromRequest(req *http.Request) (*v3.Token, err
 	} else {
 		storedToken = objs[0].(*v3.Token)
 	}
-
-	if storedToken.Token != tokenKey || storedToken.ObjectMeta.Name != tokenName {
-		return nil, fmt.Errorf("must authenticate")
-	}
-
-	if tokens.IsExpired(*storedToken) {
-		return nil, fmt.Errorf("must authenticate")
+	if _, err := tokens.VerifyToken(storedToken, tokenName, tokenKey); err != nil {
+		return nil, err
 	}
 
 	return storedToken, nil

@@ -2,17 +2,16 @@ package manager
 
 import (
 	"fmt"
-
-	"strings"
-
-	"strconv"
+	"reflect"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/rancher/pkg/catalog/utils"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 )
 
 const (
@@ -20,223 +19,184 @@ const (
 	TemplateNameLabel = "catalog.cattle.io/template_name"
 )
 
-// update will sync templates with catalog without costing too much
-func (m *Manager) update(catalog *v3.Catalog, templates []v3.Template, updateOnly bool) error {
-	logrus.Debugf("Syncing catalog %s with templates", catalog.Name)
-	existingTemplates, err := m.templateClient.List(metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", CatalogNameLabel, catalog.Name),
+func (m *Manager) createTemplate(template v3.CatalogTemplate, catalog *v3.Catalog) error {
+	template.Labels = labels.Merge(template.Labels, map[string]string{
+		CatalogNameLabel: catalog.Name,
 	})
+	versionFiles := make([]v3.TemplateVersionSpec, len(template.Spec.Versions))
+	copy(versionFiles, template.Spec.Versions)
+	for i := range template.Spec.Versions {
+		template.Spec.Versions[i].Files = nil
+		template.Spec.Versions[i].Readme = ""
+		template.Spec.Versions[i].AppReadme = ""
+	}
+	logrus.Debugf("Creating template %s", template.Name)
+	//check label length to ensure template doesn't get created without template versions
+	if len(template.Name) > 63 {
+		return errors.Errorf("failed %v must be no more than 63 characters", template.Name)
+	}
+	createdTemplate, err := m.templateClient.Create(&template)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "failed to create template %s", template.Name)
 	}
-
-	templatesByName := map[string]v3.Template{}
-	for _, template := range templates {
-		if template.Spec.FolderName == "" {
-			continue
-		} else if template.Spec.Base == "" && template.Spec.FolderName != "" {
-			template.Name = fmt.Sprintf("%s-%s", catalog.Name, template.Spec.FolderName)
-		} else {
-			template.Name = fmt.Sprintf("%s-%s-%s", catalog.Name, template.Spec.Base, template.Spec.FolderName)
-		}
-		template.Name = strings.ToLower(template.Name)
-		templatesByName[template.Name] = template
-	}
-
-	existingTemplatesByName := map[string]v3.Template{}
-	for _, template := range existingTemplates.Items {
-		existingTemplatesByName[template.Name] = template
-	}
-
-	// templates is the one we should update, so for all the templates that were in existingTemplates
-	// 1. if it doesn't exist in templates, delete them
-	// 2. if it exists, update it
-	var errs []error
-	for name, existingTemplate := range existingTemplatesByName {
-		err := m.updateTemplate(name, existingTemplate, templatesByName, updateOnly)
-		if err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	// for templates that exist in template but not in existingTemplates, we should create them
-	for name, template := range templatesByName {
-		err := m.createTemplate(name, template, existingTemplatesByName, catalog)
-		if err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) > 0 {
-		return errors.Errorf("Multiple errors happens: %v", errs)
-	}
-
-	v3.CatalogConditionRefreshed.True(catalog)
-	if _, err := m.catalogClient.Update(catalog); err != nil {
-		return err
-	}
-	return nil
+	return m.createTemplateVersions(catalog.Name, versionFiles, createdTemplate)
 }
 
-func (m *Manager) createTemplate(name string, template v3.Template, existingTemplatesByName map[string]v3.Template, catalog *v3.Catalog) error {
-	if _, ok := existingTemplatesByName[name]; !ok {
-		template.OwnerReferences = []metav1.OwnerReference{
-			{
-				APIVersion:         catalog.APIVersion,
-				Kind:               catalog.Kind,
-				Name:               catalog.Name,
-				UID:                catalog.UID,
-				BlockOwnerDeletion: &[]bool{true}[0],
-			},
-		}
-		template.Kind = v3.TemplateGroupVersionKind.Kind
-		template.APIVersion = v3.TemplateGroupVersionKind.Group + "/" + v3.TemplateGroupVersionKind.Version
-		template.Labels = map[string]string{}
-		template.Labels[CatalogNameLabel] = catalog.Name
-		versionFiles := template.Spec.Versions
-		// we are removing file fields so that the big chunk of data doesn't get stored in two places
-		var modifiedVersionFiles []v3.TemplateVersionSpec
-		for _, version := range template.Spec.Versions {
-			version.Files = nil
-			version.Readme = ""
-			modifiedVersionFiles = append(modifiedVersionFiles, version)
-		}
-		template.Spec.Versions = modifiedVersionFiles
-		logrus.Infof("Creating template %s", template.Name)
-		createdTemplate, err := m.templateClient.Create(&template)
-		if err != nil {
-			// hack for the image size that are too big
-			if strings.Contains(err.Error(), "request is too large") ||
-				strings.Contains(err.Error(), "exceeding the max size") ||
-				strings.Contains(err.Error(), "received message larger than max") {
-				logrus.Warnf("Template %s size is too large. Skipping", template.Name)
-				return nil
-			}
-			return errors.Wrapf(err, "failed to create template %s", template.Name)
-		}
-		if err := m.createTemplateVersions(versionFiles, *createdTemplate); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (m *Manager) updateTemplate(name string, existingTemplate v3.Template, templatesByName map[string]v3.Template, updateOnly bool) error {
-	template, ok := templatesByName[name]
-	if !ok && !updateOnly {
-		// delete the template
-		logrus.Infof("Deleting templates %s", name)
-		if err := m.templateClient.Delete(name, &metav1.DeleteOptions{}); err != nil {
-			return errors.Wrapf(err, "failed to delete template %s", template.Name)
-		}
-		if err := m.deleteTemplateVersions(existingTemplate); err != nil {
-			return errors.Wrapf(err, "failed to delete templateVersion with template %s", template.Name)
-		}
-	} else if !ok && updateOnly {
-		return nil
-	}
-
-	updateTemplate, err := m.templateClient.Get(name, metav1.GetOptions{})
-	if err != nil && !kerrors.IsNotFound(err) {
-		return errors.Wrapf(err, "failed to get template %s", name)
-	} else if kerrors.IsNotFound(err) {
-		return nil
-	}
-	updateTemplate.Spec = template.Spec
-	template.Spec.Versions = updateTemplate.Spec.Versions
-	var modifiedVersionFiles []v3.TemplateVersionSpec
-	for _, version := range updateTemplate.Spec.Versions {
-		version.Files = nil
-		version.Readme = ""
-		modifiedVersionFiles = append(modifiedVersionFiles, version)
-	}
-	updateTemplate.Spec.Versions = modifiedVersionFiles
-	logrus.Infof("Updating template %s", name)
-	result, err := m.templateClient.Update(updateTemplate)
+func (m *Manager) getTemplateMap(catalogName string, namespace string) (map[string]*v3.CatalogTemplate, error) {
+	r, _ := labels.NewRequirement(CatalogNameLabel, selection.Equals, []string{catalogName})
+	templateList, err := m.templateLister.List(namespace, labels.NewSelector().Add(*r))
 	if err != nil {
-		if strings.Contains(err.Error(), "request is too large") || strings.Contains(err.Error(), "exceeding the max size") {
-			logrus.Warnf("Template %s size is too large. Skipping", template.Name)
-			return nil
-		}
-		return errors.Wrapf(err, "failed to update template %s", template.Name)
+		return nil, errors.Wrapf(err, "failed to list templates for %v", catalogName)
 	}
-	if err := m.deleteTemplateVersions(*result); err != nil {
-		return err
+	templateMap := map[string]*v3.CatalogTemplate{}
+	for _, t := range templateList {
+		templateMap[t.Name] = t
 	}
-	return m.createTemplateVersions(template.Spec.Versions, *result)
+	return templateMap, nil
 }
 
-func (m *Manager) createTemplateVersions(versionsSpec []v3.TemplateVersionSpec, template v3.Template) error {
-	var createdTemplates []string
-	rollback := false
-	for _, spec := range versionsSpec {
-		templateVersion := v3.TemplateVersion{}
-		templateVersion.Spec = spec
-		revision := spec.Version
-		if spec.Revision != nil {
-			revision = strconv.Itoa(*spec.Revision)
-		}
-		templateVersion.APIVersion = v3.TemplateVersionGroupVersionKind.Group + "/" + v3.TemplateVersionGroupVersionKind.Version
-		templateVersion.Kind = v3.TemplateVersionGroupVersionKind.Kind
-		templateVersion.Name = fmt.Sprintf("%s-%v", template.Name, revision)
-		templateVersion.Labels = make(map[string]string)
-		templateVersion.Labels[TemplateNameLabel] = template.Name
-		templateVersion.OwnerReferences = []metav1.OwnerReference{
-			{
-				APIVersion:         template.APIVersion,
-				Kind:               template.Kind,
-				Name:               template.Name,
-				UID:                template.UID,
-				BlockOwnerDeletion: &[]bool{true}[0],
-			},
-		}
-		logrus.Debugf("Creating templateVersion %s", templateVersion.Name)
-		_, err := m.templateVersionClient.Create(&templateVersion)
-		if err != nil {
-			logrus.Error(err)
-			rollback = true
-			break
-		}
-		createdTemplates = append(createdTemplates, templateVersion.Name)
+func (m *Manager) updateTemplate(template *v3.CatalogTemplate, toUpdate v3.CatalogTemplate) error {
+	r, err := labels.NewRequirement(TemplateNameLabel, selection.Equals, []string{template.Name})
+	if err != nil {
+		return errors.Wrapf(err, "failed to find template version with label %v for %v", TemplateNameLabel, template.Name)
 	}
-	if rollback {
-		logrus.Info("Rollback TemplateVersion")
-		for _, name := range createdTemplates {
-			logrus.Infof("Deleting templateVersion %s", name)
-			err := m.templateVersionClient.Delete(name, &metav1.DeleteOptions{})
-			if err != nil && !kerrors.IsNotFound(err) {
-				return errors.Wrapf(err, "failed to rollback and delete templateVersion %s", name)
-			}
-		}
-	}
-	return nil
-}
-
-func (m *Manager) deleteTemplateVersions(template v3.Template) error {
-	templateVersions, err := m.templateVersionClient.List(metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", TemplateNameLabel, template.Name),
-	})
+	templateVersions, err := m.templateVersionLister.List(template.Namespace, labels.NewSelector().Add(*r))
 	if err != nil {
 		return errors.Wrapf(err, "failed to list templateVersions")
 	}
-	for _, version := range templateVersions.Items {
-		logrus.Infof("Deleting templateVersion %s", version.Name)
-		if err := m.templateVersionClient.Delete(version.Name, &metav1.DeleteOptions{}); err != nil && !kerrors.IsNotFound(err) {
+	tvByVersion := map[string]*v3.CatalogTemplateVersion{}
+	for _, ver := range templateVersions {
+		tvByVersion[ver.Spec.Version] = ver
+	}
+	/*
+		For each templateVersion in toUpdate, if spec doesn't match, do update
+		For version that doesn't exist, create a new one
+	*/
+	for _, toUpdateVer := range toUpdate.Spec.Versions {
+		templateVersion := &v3.CatalogTemplateVersion{}
+		templateVersion.Spec = toUpdateVer
+		if tv, ok := tvByVersion[toUpdateVer.Version]; ok {
+			if !reflect.DeepEqual(tv.Spec, toUpdateVer) {
+				logrus.Debugf("Updating templateVersion %v", tv.Name)
+				newObject := tv.DeepCopy()
+				newObject.Spec = templateVersion.Spec
+				if _, err := m.templateVersionClient.Update(newObject); err != nil {
+					return err
+				}
+			}
+		} else {
+			toCreate := &v3.CatalogTemplateVersion{}
+			toCreate.Name = fmt.Sprintf("%s-%v", template.Name, toUpdateVer.Version)
+			toCreate.Namespace = template.Namespace
+			toCreate.Labels = map[string]string{
+				TemplateNameLabel: template.Name,
+			}
+			toCreate.Spec = templateVersion.Spec
+			logrus.Debugf("Creating templateVersion %v", toCreate.Name)
+			if _, err := m.templateVersionClient.Create(toCreate); err != nil {
+				return err
+			}
+		}
+	}
+
+	// find existing templateVersion that is not in toUpdate.Versions
+	toUpdateTvs := map[string]struct{}{}
+	for _, toUpdateVer := range toUpdate.Spec.Versions {
+		toUpdateTvs[toUpdateVer.Version] = struct{}{}
+	}
+	for v, tv := range tvByVersion {
+		if _, ok := toUpdateTvs[v]; !ok {
+			logrus.Infof("Deleting templateVersion %s", tv.Name)
+			if err := m.templateVersionClient.DeleteNamespaced(template.Namespace, tv.Name, &metav1.DeleteOptions{}); err != nil && !kerrors.IsNotFound(err) {
+				return err
+			}
+		}
+	}
+
+	for i := range toUpdate.Spec.Versions {
+		toUpdate.Spec.Versions[i].Files = nil
+		toUpdate.Spec.Versions[i].Readme = ""
+		toUpdate.Spec.Versions[i].AppReadme = ""
+	}
+	newObj := template.DeepCopy()
+	newObj.Spec = toUpdate.Spec
+	newObj.Labels = mergeLabels(template.Labels, toUpdate.Labels)
+	if _, err := m.templateClient.Update(newObj); err != nil {
+		return err
+	}
+	return nil
+}
+
+// merge any label from set2 into set1 and delete label
+func mergeLabels(set1, set2 map[string]string) map[string]string {
+	if set1 == nil {
+		set1 = map[string]string{}
+	}
+	for k, v := range set2 {
+		set1[k] = v
+	}
+	for k := range set1 {
+		if set2 != nil {
+			if _, ok := set2[k]; !ok && k != CatalogNameLabel {
+				delete(set1, k)
+			}
+		} else {
+			if k != CatalogNameLabel {
+				delete(set1, k)
+			}
+		}
+
+	}
+	return set1
+}
+
+func (m *Manager) getTemplateVersion(templateName string, namespace string) (map[string]struct{}, error) {
+	//because templates is a cluster resource now so we set namespace to "" when listing it.
+	r, err := labels.NewRequirement(TemplateNameLabel, selection.Equals, []string{templateName})
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to find template version with label %v for %v", TemplateNameLabel, templateName)
+	}
+	templateVersions, err := m.templateVersionLister.List(namespace, labels.NewSelector().Add(*r))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to list template version(s) for %v: ", templateName)
+	}
+	tVersion := map[string]struct{}{}
+	for _, ver := range templateVersions {
+		tVersion[ver.Name] = struct{}{}
+	}
+	return tVersion, nil
+}
+
+func (m *Manager) createTemplateVersions(catalogName string, versionsSpec []v3.TemplateVersionSpec, template *v3.CatalogTemplate) error {
+	for _, spec := range versionsSpec {
+		templateVersion := &v3.CatalogTemplateVersion{}
+		templateVersion.Spec = spec
+		templateVersion.Status = v3.TemplateVersionStatus{HelmVersion: template.Status.HelmVersion}
+		templateVersion.Name = fmt.Sprintf("%s-%v", template.Name, spec.Version)
+		templateVersion.Namespace = template.Namespace
+		templateVersion.Labels = map[string]string{
+			TemplateNameLabel: template.Name,
+		}
+		//help with garbage collection on delete
+		ownerRef := []metav1.OwnerReference{{
+			Name:       template.Name,
+			APIVersion: "management.cattle.io/v3",
+			UID:        template.UID,
+			Kind:       template.Kind,
+		}}
+		templateVersion.OwnerReferences = ownerRef
+
+		logrus.Debugf("Creating templateVersion %s", templateVersion.Name)
+		if _, err := m.templateVersionClient.Create(templateVersion); err != nil && !kerrors.IsAlreadyExists(err) {
 			return err
 		}
 	}
 	return nil
 }
 
-func showUpgradeLinks(version, upgradeVersion, upgradeFrom string) bool {
+func showUpgradeLinks(version, upgradeVersion string) bool {
 	if !utils.VersionGreaterThan(upgradeVersion, version) {
 		return false
-	}
-	if upgradeFrom != "" {
-		satisfiesRange, err := utils.VersionSatisfiesRange(version, upgradeFrom)
-		if err != nil {
-			return false
-		}
-		return satisfiesRange
 	}
 	return true
 }

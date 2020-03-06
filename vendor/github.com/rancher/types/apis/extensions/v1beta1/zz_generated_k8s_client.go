@@ -4,17 +4,22 @@ import (
 	"context"
 	"sync"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
-	"k8s.io/client-go/dynamic"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/objectclient/dynamic"
+	"github.com/rancher/norman/restwatch"
 	"k8s.io/client-go/rest"
+)
+
+type (
+	contextKeyType        struct{}
+	contextClientsKeyType struct{}
 )
 
 type Interface interface {
 	RESTClient() rest.Interface
 	controller.Starter
 
-	PodSecurityPoliciesGetter
 	IngressesGetter
 }
 
@@ -23,17 +28,15 @@ type Client struct {
 	restClient rest.Interface
 	starters   []controller.Starter
 
-	podSecurityPolicyControllers map[string]PodSecurityPolicyController
-	ingressControllers           map[string]IngressController
+	ingressControllers map[string]IngressController
 }
 
 func NewForConfig(config rest.Config) (Interface, error) {
 	if config.NegotiatedSerializer == nil {
-		configConfig := dynamic.ContentConfig()
-		config.NegotiatedSerializer = configConfig.NegotiatedSerializer
+		config.NegotiatedSerializer = dynamic.NegotiatedSerializer
 	}
 
-	restClient, err := rest.UnversionedRESTClientFor(&config)
+	restClient, err := restwatch.UnversionedRESTClientFor(&config)
 	if err != nil {
 		return nil, err
 	}
@@ -41,8 +44,7 @@ func NewForConfig(config rest.Config) (Interface, error) {
 	return &Client{
 		restClient: restClient,
 
-		podSecurityPolicyControllers: map[string]PodSecurityPolicyController{},
-		ingressControllers:           map[string]IngressController{},
+		ingressControllers: map[string]IngressController{},
 	}, nil
 }
 
@@ -58,25 +60,12 @@ func (c *Client) Start(ctx context.Context, threadiness int) error {
 	return controller.Start(ctx, threadiness, c.starters...)
 }
 
-type PodSecurityPoliciesGetter interface {
-	PodSecurityPolicies(namespace string) PodSecurityPolicyInterface
-}
-
-func (c *Client) PodSecurityPolicies(namespace string) PodSecurityPolicyInterface {
-	objectClient := clientbase.NewObjectClient(namespace, c.restClient, &PodSecurityPolicyResource, PodSecurityPolicyGroupVersionKind, podSecurityPolicyFactory{})
-	return &podSecurityPolicyClient{
-		ns:           namespace,
-		client:       c,
-		objectClient: objectClient,
-	}
-}
-
 type IngressesGetter interface {
 	Ingresses(namespace string) IngressInterface
 }
 
 func (c *Client) Ingresses(namespace string) IngressInterface {
-	objectClient := clientbase.NewObjectClient(namespace, c.restClient, &IngressResource, IngressGroupVersionKind, ingressFactory{})
+	objectClient := objectclient.NewObjectClient(namespace, c.restClient, &IngressResource, IngressGroupVersionKind, ingressFactory{})
 	return &ingressClient{
 		ns:           namespace,
 		client:       c,

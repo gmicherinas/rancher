@@ -10,7 +10,8 @@ const (
 	ObjectMetaFieldNamespace       = "namespace"
 	ObjectMetaFieldOwnerReferences = "ownerReferences"
 	ObjectMetaFieldRemoved         = "removed"
-	ObjectMetaFieldUuid            = "uuid"
+	ObjectMetaFieldSelfLink        = "selfLink"
+	ObjectMetaFieldUUID            = "uuid"
 )
 
 type ObjectMeta struct {
@@ -22,5 +23,6 @@ type ObjectMeta struct {
 	Namespace       string            `json:"namespace,omitempty" yaml:"namespace,omitempty"`
 	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	SelfLink        string            `json:"selfLink,omitempty" yaml:"selfLink,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }

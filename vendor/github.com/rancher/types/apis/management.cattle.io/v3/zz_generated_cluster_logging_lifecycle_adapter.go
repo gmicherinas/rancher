@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type ClusterLoggingLifecycle interface {
-	Create(obj *ClusterLogging) (*ClusterLogging, error)
-	Remove(obj *ClusterLogging) (*ClusterLogging, error)
-	Updated(obj *ClusterLogging) (*ClusterLogging, error)
+	Create(obj *ClusterLogging) (runtime.Object, error)
+	Remove(obj *ClusterLogging) (runtime.Object, error)
+	Updated(obj *ClusterLogging) (runtime.Object, error)
 }
 
 type clusterLoggingLifecycleAdapter struct {
 	lifecycle ClusterLoggingLifecycle
+}
+
+func (w *clusterLoggingLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *clusterLoggingLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *clusterLoggingLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *clusterLoggingLifecycleAdapter) Updated(obj runtime.Object) (runtime.Ob
 }
 
 func NewClusterLoggingLifecycleAdapter(name string, clusterScoped bool, client ClusterLoggingInterface, l ClusterLoggingLifecycle) ClusterLoggingHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(ClusterLoggingGroupVersionResource)
+	}
 	adapter := &clusterLoggingLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *ClusterLogging) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *ClusterLogging) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

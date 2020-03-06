@@ -15,14 +15,15 @@ func (c *Creator) FromInternal(data map[string]interface{}) {
 	}
 }
 
-func (c *Creator) ToInternal(data map[string]interface{}) {
+func (c *Creator) ToInternal(data map[string]interface{}) error {
 	if c.m != nil {
-		c.m.ToInternal(data)
+		return c.m.ToInternal(data)
 	}
+	return nil
 }
 
 func (c *Creator) ModifySchema(schema *types.Schema, schemas *types.Schemas) error {
-	if schema.CanList(nil) && schema.CanCreate(nil) {
+	if schema.CanList(nil) == nil && schema.CanCreate(nil) == nil {
 		schema.ResourceFields["creatorId"] = types.Field{
 			Type:     "reference[/v3/schemas/user]",
 			CodeName: "CreatorID",

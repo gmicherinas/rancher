@@ -1,9 +1,11 @@
 package v3
 
 import (
+	"strings"
+
 	"github.com/rancher/norman/condition"
 	"github.com/rancher/norman/types"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -16,23 +18,47 @@ type App struct {
 	Status AppStatus `json:"status,omitempty"`
 }
 
+func (a *App) ObjClusterName() string {
+	return a.Spec.ObjClusterName()
+}
+
 type AppSpec struct {
-	ProjectName      string            `json:"projectName,omitempty" norman:"type=reference[/v3/schemas/project]"`
-	Description      string            `json:"description,omitempty"`
-	InstallNamespace string            `json:"installNamespace,omitempty"`
-	ExternalID       string            `json:"externalId,omitempty"`
-	Templates        map[string]string `json:"templates,omitempty"`
-	Answers          map[string]string `json:"answers,omitempty"`
-	AnswerValues     string            `json:"answerValues,omitempty"`
+	ProjectName         string            `json:"projectName,omitempty" norman:"type=reference[/v3/schemas/project]"`
+	Description         string            `json:"description,omitempty"`
+	TargetNamespace     string            `json:"targetNamespace,omitempty"`
+	ExternalID          string            `json:"externalId,omitempty"`
+	Files               map[string]string `json:"files,omitempty"`
+	Answers             map[string]string `json:"answers,omitempty"`
+	Wait                bool              `json:"wait,omitempty"`
+	Timeout             int               `json:"timeout,omitempty" norman:"min=1,default=300"`
+	AppRevisionName     string            `json:"appRevisionName,omitempty" norman:"type=reference[/v3/project/schemas/apprevision]"`
+	Prune               bool              `json:"prune,omitempty"`
+	MultiClusterAppName string            `json:"multiClusterAppName,omitempty" norman:"type=reference[/v3/schemas/multiclusterapp]"`
+	ValuesYaml          string            `json:"valuesYaml,omitempty"`
+}
+
+func (a *AppSpec) ObjClusterName() string {
+	if parts := strings.SplitN(a.ProjectName, ":", 2); len(parts) == 2 {
+		return parts[0]
+	}
+	return ""
 }
 
 var (
-	AppConditionInstalled condition.Cond = "installed"
+	AppConditionInstalled                  condition.Cond = "Installed"
+	AppConditionMigrated                   condition.Cond = "Migrated"
+	AppConditionDeployed                   condition.Cond = "Deployed"
+	AppConditionForceUpgrade               condition.Cond = "ForceUpgrade"
+	AppConditionUserTriggeredAction        condition.Cond = "UserTriggeredAction"
+	IstioConditionMetricExpressionDeployed condition.Cond = "MetricExpressionDeployed"
 )
 
 type AppStatus struct {
-	Releases   []ReleaseInfo  `json:"releases,omitempty"`
-	Conditions []AppCondition `json:"conditions,omitempty"`
+	AppliedFiles         map[string]string `json:"appliedFiles,omitempty"`
+	Notes                string            `json:"notes,omitempty"`
+	Conditions           []AppCondition    `json:"conditions,omitempty"`
+	LastAppliedTemplates string            `json:"lastAppliedTemplate,omitempty"`
+	HelmVersion          string            `json:"helmVersion,omitempty" norman:"noupdate,nocreate"`
 }
 
 type AppCondition struct {
@@ -50,10 +76,51 @@ type AppCondition struct {
 	Message string `json:"message,omitempty"`
 }
 
-type ReleaseInfo struct {
-	Name              string `json:"name"`
-	Version           string `json:"version"`
-	CreateTimestamp   string `json:"createTimestamp"`
-	ModifiedAt        string `json:"modifiedAt"`
-	TemplateVersionID string `json:"templateVersionId"`
+type AppRevision struct {
+	types.Namespaced
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   AppRevisionSpec   `json:"spec,omitempty"`
+	Status AppRevisionStatus `json:"status,omitempty"`
+}
+
+type AppRevisionSpec struct {
+	ProjectName string `json:"projectName,omitempty" norman:"type=reference[/v3/schemas/project]"`
+}
+
+func (a *AppRevisionSpec) ObjClusterName() string {
+	if parts := strings.SplitN(a.ProjectName, ":", 2); len(parts) == 2 {
+		return parts[0]
+	}
+	return ""
+}
+
+type AppRevisionStatus struct {
+	ProjectName string            `json:"projectName,omitempty" norman:"type=reference[/v3/schemas/project]"`
+	ExternalID  string            `json:"externalId"`
+	Answers     map[string]string `json:"answers"`
+	Digest      string            `json:"digest"`
+	ValuesYaml  string            `json:"valuesYaml,omitempty"`
+	Files       map[string]string `json:"files,omitempty"`
+}
+
+func (a *AppRevisionStatus) ObjClusterName() string {
+	if parts := strings.SplitN(a.ProjectName, ":", 2); len(parts) == 2 {
+		return parts[0]
+	}
+	return ""
+}
+
+type AppUpgradeConfig struct {
+	ExternalID   string            `json:"externalId,omitempty"`
+	Answers      map[string]string `json:"answers,omitempty"`
+	ForceUpgrade bool              `json:"forceUpgrade,omitempty"`
+	Files        map[string]string `json:"files,omitempty"`
+	ValuesYaml   string            `json:"valuesYaml,omitempty"`
+}
+
+type RollbackRevision struct {
+	RevisionName string `json:"revisionName,omitempty" norman:"type=reference[/v3/project/schemas/apprevision]"`
+	ForceUpgrade bool   `json:"forceUpgrade,omitempty"`
 }

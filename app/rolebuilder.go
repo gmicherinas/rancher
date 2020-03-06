@@ -2,16 +2,15 @@ package app
 
 import (
 	"fmt"
-
 	"reflect"
 
 	"github.com/pkg/errors"
-	"github.com/rancher/norman/clientbase"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/norman/objectclient"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config"
 	"github.com/sirupsen/logrus"
 	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -28,6 +27,7 @@ type roleBuilder struct {
 	builtin           bool
 	external          bool
 	hidden            bool
+	administrative    bool
 	roleTemplateNames []string
 	rules             []*ruleBuilder
 }
@@ -37,15 +37,17 @@ func (rb *roleBuilder) String() string {
 }
 
 func newRoleBuilder() *roleBuilder {
-	return &roleBuilder{}
+	return &roleBuilder{
+		builtin: true,
+	}
 }
 
-func (rb *roleBuilder) addRoleTemplate(displayName, name, context string, builtin, external, hidden bool) *roleBuilder {
+func (rb *roleBuilder) addRoleTemplate(displayName, name, context string, external, hidden, administrative bool) *roleBuilder {
 	r := rb.addRole(displayName, name)
 	r.context = context
-	r.builtin = builtin
 	r.external = external
 	r.hidden = hidden
+	r.administrative = administrative
 	return r
 }
 
@@ -59,11 +61,11 @@ func (rb *roleBuilder) addRole(displayName, name string) *roleBuilder {
 	if rb.next != nil {
 		return rb.next.addRole(displayName, name)
 	}
-	rb.next = &roleBuilder{
-		name:        name,
-		displayName: displayName,
-		previous:    rb,
-	}
+	rb.next = newRoleBuilder()
+	rb.next.name = name
+	rb.next.displayName = displayName
+	rb.next.previous = rb
+
 	return rb.next
 }
 
@@ -133,12 +135,12 @@ func (r *ruleBuilder) nonResourceURLs(u ...string) *ruleBuilder {
 	return r
 }
 
-func (r *ruleBuilder) addRoleTemplate(diplsayName, name, context string, builtin, external, hidden bool) *roleBuilder {
-	return r.rb.addRoleTemplate(diplsayName, name, context, builtin, external, hidden)
+func (r *ruleBuilder) addRoleTemplate(displayName, name, context string, external, hidden, administrative bool) *roleBuilder {
+	return r.rb.addRoleTemplate(displayName, name, context, external, hidden, administrative)
 }
 
-func (r *ruleBuilder) addRole(diplsayName, name string) *roleBuilder {
-	return r.rb.addRole(diplsayName, name)
+func (r *ruleBuilder) addRole(displayName, name string) *roleBuilder {
+	return r.rb.addRole(displayName, name)
 }
 
 func (r *ruleBuilder) addRule() *ruleBuilder {
@@ -171,7 +173,7 @@ type buildFnc func(thisRB *roleBuilder) (string, runtime.Object)
 type compareAndModifyFnc func(have runtime.Object, want runtime.Object) (bool, runtime.Object, error)
 type gatherExistingFnc func() (map[string]runtime.Object, error)
 
-func (rb *roleBuilder) reconcile(build buildFnc, gatherExisting gatherExistingFnc, compareAndModify compareAndModifyFnc, client *clientbase.ObjectClient) error {
+func (rb *roleBuilder) reconcile(build buildFnc, gatherExisting gatherExistingFnc, compareAndModify compareAndModifyFnc, client *objectclient.ObjectClient) error {
 	current := rb.first()
 	builtRoles := map[string]runtime.Object{}
 	for current != nil {
@@ -229,6 +231,7 @@ func (rb *roleBuilder) reconcileGlobalRoles(mgmt *config.ManagementContext) erro
 			},
 			DisplayName: current.displayName,
 			Rules:       current.policyRules(),
+			Builtin:     current.builtin,
 		}
 		return gr.Name, gr
 	}
@@ -256,10 +259,12 @@ func (rb *roleBuilder) reconcileGlobalRoles(mgmt *config.ManagementContext) erro
 			return false, nil, errors.Errorf("unexpected type comparing %v and %v", have, want)
 		}
 
-		equal := haveGR.DisplayName == wantGR.DisplayName && reflect.DeepEqual(haveGR.Rules, wantGR.Rules)
+		builtin := haveGR.Builtin == wantGR.Builtin
+		equal := builtin && haveGR.DisplayName == wantGR.DisplayName && reflect.DeepEqual(haveGR.Rules, wantGR.Rules)
 
 		haveGR.DisplayName = wantGR.DisplayName
 		haveGR.Rules = wantGR.Rules
+		haveGR.Builtin = wantGR.Builtin
 
 		return equal, haveGR, nil
 	}
@@ -283,6 +288,7 @@ func (rb *roleBuilder) reconcileRoleTemplates(mgmt *config.ManagementContext) er
 			Context:           current.context,
 			Rules:             current.policyRules(),
 			RoleTemplateNames: current.roleTemplateNames,
+			Administrative:    current.administrative,
 		}
 		return role.Name, role
 	}
@@ -311,8 +317,9 @@ func (rb *roleBuilder) reconcileRoleTemplates(mgmt *config.ManagementContext) er
 		}
 
 		equal := haveRT.DisplayName == wantRT.DisplayName && reflect.DeepEqual(haveRT.Rules, wantRT.Rules) &&
-			reflect.DeepEqual(haveRT.RoleTemplateNames, wantRT.RoleTemplateNames) && haveRT.Builtin != wantRT.Builtin &&
-			haveRT.External == wantRT.External && haveRT.Hidden == wantRT.Hidden && haveRT.Context == wantRT.Context
+			reflect.DeepEqual(haveRT.RoleTemplateNames, wantRT.RoleTemplateNames) && haveRT.Builtin == wantRT.Builtin &&
+			haveRT.External == wantRT.External && haveRT.Hidden == wantRT.Hidden && haveRT.Context == wantRT.Context &&
+			haveRT.Administrative == wantRT.Administrative
 
 		haveRT.DisplayName = wantRT.DisplayName
 		haveRT.Rules = wantRT.Rules
@@ -321,6 +328,7 @@ func (rb *roleBuilder) reconcileRoleTemplates(mgmt *config.ManagementContext) er
 		haveRT.External = wantRT.External
 		haveRT.Hidden = wantRT.Hidden
 		haveRT.Context = wantRT.Context
+		haveRT.Administrative = wantRT.Administrative
 
 		return equal, haveRT, nil
 	}

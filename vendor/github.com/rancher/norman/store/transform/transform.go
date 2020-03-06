@@ -1,15 +1,18 @@
 package transform
 
 import (
+	"fmt"
+
+	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
 )
 
-type TransformerFunc func(apiContext *types.APIContext, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error)
+type TransformerFunc func(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error)
 
-type ListTransformerFunc func(apiContext *types.APIContext, data []map[string]interface{}, opt *types.QueryOptions) ([]map[string]interface{}, error)
+type ListTransformerFunc func(apiContext *types.APIContext, schema *types.Schema, data []map[string]interface{}, opt *types.QueryOptions) ([]map[string]interface{}, error)
 
-type StreamTransformerFunc func(apiContext *types.APIContext, data chan map[string]interface{}, opt *types.QueryOptions) (chan map[string]interface{}, error)
+type StreamTransformerFunc func(apiContext *types.APIContext, schema *types.Schema, data chan map[string]interface{}, opt *types.QueryOptions) (chan map[string]interface{}, error)
 
 type Store struct {
 	Store             types.Store
@@ -30,11 +33,15 @@ func (s *Store) ByID(apiContext *types.APIContext, schema *types.Schema, id stri
 	if s.Transformer == nil {
 		return data, nil
 	}
-	return s.Transformer(apiContext, data, &types.QueryOptions{
+	obj, err := s.Transformer(apiContext, schema, data, &types.QueryOptions{
 		Options: map[string]string{
 			"ByID": "true",
 		},
 	})
+	if obj == nil && err == nil {
+		return obj, httperror.NewAPIError(httperror.NotFound, fmt.Sprintf("%s not found", id))
+	}
+	return obj, err
 }
 
 func (s *Store) Watch(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) (chan map[string]interface{}, error) {
@@ -44,11 +51,11 @@ func (s *Store) Watch(apiContext *types.APIContext, schema *types.Schema, opt *t
 	}
 
 	if s.StreamTransformer != nil {
-		return s.StreamTransformer(apiContext, c, opt)
+		return s.StreamTransformer(apiContext, schema, c, opt)
 	}
 
 	return convert.Chan(c, func(data map[string]interface{}) map[string]interface{} {
-		item, err := s.Transformer(apiContext, data, opt)
+		item, err := s.Transformer(apiContext, schema, data, opt)
 		if err != nil {
 			return nil
 		}
@@ -63,7 +70,7 @@ func (s *Store) List(apiContext *types.APIContext, schema *types.Schema, opt *ty
 	}
 
 	if s.ListTransformer != nil {
-		return s.ListTransformer(apiContext, data, opt)
+		return s.ListTransformer(apiContext, schema, data, opt)
 	}
 
 	if s.Transformer == nil {
@@ -72,7 +79,7 @@ func (s *Store) List(apiContext *types.APIContext, schema *types.Schema, opt *ty
 
 	var result []map[string]interface{}
 	for _, item := range data {
-		item, err := s.Transformer(apiContext, item, opt)
+		item, err := s.Transformer(apiContext, schema, item, opt)
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +99,7 @@ func (s *Store) Create(apiContext *types.APIContext, schema *types.Schema, data 
 	if s.Transformer == nil {
 		return data, nil
 	}
-	return s.Transformer(apiContext, data, nil)
+	return s.Transformer(apiContext, schema, data, nil)
 }
 
 func (s *Store) Update(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, id string) (map[string]interface{}, error) {
@@ -103,9 +110,13 @@ func (s *Store) Update(apiContext *types.APIContext, schema *types.Schema, data 
 	if s.Transformer == nil {
 		return data, nil
 	}
-	return s.Transformer(apiContext, data, nil)
+	return s.Transformer(apiContext, schema, data, nil)
 }
 
 func (s *Store) Delete(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
-	return s.Store.Delete(apiContext, schema, id)
+	obj, err := s.Store.Delete(apiContext, schema, id)
+	if err != nil || obj == nil {
+		return obj, err
+	}
+	return s.Transformer(apiContext, schema, obj, nil)
 }

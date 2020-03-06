@@ -1,88 +1,93 @@
 package rkeworker
 
 import (
+	"bytes"
 	"context"
-	"log"
-	"net/http"
-	"net/url"
-	"sync"
+	"encoding/base64"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 
-	"fmt"
-	"net"
-	"os/exec"
-
-	"github.com/rancher/rancher/pkg/clusterrouter/proxy"
+	"github.com/rancher/norman/types"
 	"github.com/rancher/rancher/pkg/rkecerts"
-	"github.com/sirupsen/logrus"
 )
 
-const (
-	tlsKey  = "/etc/kubernetes/ssl/kube-apiserver-key.pem"
-	tlsCert = "/etc/kubernetes/ssl/kube-apiserver.pem"
-)
-
-var (
-	apiProxy sync.Once
-)
-
-func ExecutePlan(ctx context.Context, serverURL string, nodeConfig *NodeConfig) error {
+func ExecutePlan(ctx context.Context, nodeConfig *NodeConfig, writeCertOnly bool) error {
+	var bundleChanged bool
 	if nodeConfig.Certs != "" {
 		bundle, err := rkecerts.Unmarshal(nodeConfig.Certs)
 		if err != nil {
 			return err
 		}
-
+		bundleChanged = bundle.Changed()
 		if err := bundle.Explode(); err != nil {
 			return err
 		}
 	}
 
+	f := fileWriter{}
+	for _, file := range nodeConfig.Files {
+		f.write(file.Name, file.Contents)
+	}
+	if writeCertOnly {
+		return nil
+	}
+
 	for name, process := range nodeConfig.Processes {
-		if err := runProcess(ctx, name, process); err != nil {
-			return err
+		if strings.Contains(name, "sidekick") || strings.Contains(name, "share-mnt") {
+			// windows dockerfile VOLUME declaration must to satisfy one of them:
+			// 	- a non-existing or empty directory
+			//  - a drive other than C:
+			// so we could use a script to **start** the container to put expected resources into the "shared" directory,
+			// like the action of `/usr/bin/sidecar.ps1` for windows rke-tools container
+			if err := runProcess(ctx, name, process, runtime.GOOS == "windows", false); err != nil {
+				return err
+			}
 		}
 	}
 
-	if nodeConfig.APIProxyAddress != "" {
-		apiProxy.Do(func() {
-			if err := startHTTPServer(nodeConfig.APIProxyAddress, serverURL); err != nil {
-				logrus.Fatalf("Failed to start API proxy: %v", err)
+	for name, process := range nodeConfig.Processes {
+		if !strings.Contains(name, "sidekick") {
+			if err := runProcess(ctx, name, process, true, bundleChanged); err != nil {
+				return err
 			}
-		})
+		}
 	}
 
 	return nil
 }
 
-func startHTTPServer(address, serverURL string) error {
-	parsedURL, err := url.Parse(serverURL)
+type fileWriter struct {
+	errs []error
+}
+
+func (f *fileWriter) write(path string, base64Content string) {
+	if path == "" {
+		return
+	}
+
+	content, err := base64.StdEncoding.DecodeString(base64Content)
 	if err != nil {
-		return err
+		f.errs = append(f.errs, err)
+		return
 	}
 
-	proxy, err := proxy.NewSimpleProxy(parsedURL.Host, nil)
-	if err != nil {
-		return err
+	existing, err := ioutil.ReadFile(path)
+	if err == nil && bytes.Equal(existing, content) {
+		return
 	}
 
-	wrapped := func(rw http.ResponseWriter, req *http.Request) {
-		req.Header.Set("X-API-K8s-Node-Client", "true")
-		req.Host = parsedURL.Host
-		proxy.ServeHTTP(rw, req)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		f.errs = append(f.errs, err)
 	}
-
-	host, _, err := net.SplitHostPort(address)
-	if err == nil {
-		err := exec.Command("ip", "addr", "add", fmt.Sprintf("%s/32", host), "dev", "lo").Run()
-		if err != nil {
-			logrus.Warnf("Failed to assign IP %s: %v", host, err)
-		}
+	if err := ioutil.WriteFile(path, content, 0600); err != nil {
+		f.errs = append(f.errs, err)
 	}
+}
 
-	go func() {
-		err := http.ListenAndServeTLS(address, tlsCert, tlsKey, http.HandlerFunc(wrapped))
-		log.Fatal(err)
-	}()
-
-	return nil
+func (f *fileWriter) err() error {
+	return types.NewErrors(f.errs...)
 }

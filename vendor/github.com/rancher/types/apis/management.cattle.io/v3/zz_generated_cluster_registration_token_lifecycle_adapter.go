@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type ClusterRegistrationTokenLifecycle interface {
-	Create(obj *ClusterRegistrationToken) (*ClusterRegistrationToken, error)
-	Remove(obj *ClusterRegistrationToken) (*ClusterRegistrationToken, error)
-	Updated(obj *ClusterRegistrationToken) (*ClusterRegistrationToken, error)
+	Create(obj *ClusterRegistrationToken) (runtime.Object, error)
+	Remove(obj *ClusterRegistrationToken) (runtime.Object, error)
+	Updated(obj *ClusterRegistrationToken) (runtime.Object, error)
 }
 
 type clusterRegistrationTokenLifecycleAdapter struct {
 	lifecycle ClusterRegistrationTokenLifecycle
+}
+
+func (w *clusterRegistrationTokenLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *clusterRegistrationTokenLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *clusterRegistrationTokenLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *clusterRegistrationTokenLifecycleAdapter) Updated(obj runtime.Object) (
 }
 
 func NewClusterRegistrationTokenLifecycleAdapter(name string, clusterScoped bool, client ClusterRegistrationTokenInterface, l ClusterRegistrationTokenLifecycle) ClusterRegistrationTokenHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(ClusterRegistrationTokenGroupVersionResource)
+	}
 	adapter := &clusterRegistrationTokenLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *ClusterRegistrationToken) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *ClusterRegistrationToken) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

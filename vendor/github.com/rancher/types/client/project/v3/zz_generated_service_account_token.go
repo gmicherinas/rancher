@@ -20,7 +20,7 @@ const (
 	ServiceAccountTokenFieldProjectID       = "projectId"
 	ServiceAccountTokenFieldRemoved         = "removed"
 	ServiceAccountTokenFieldToken           = "token"
-	ServiceAccountTokenFieldUuid            = "uuid"
+	ServiceAccountTokenFieldUUID            = "uuid"
 )
 
 type ServiceAccountToken struct {
@@ -39,8 +39,9 @@ type ServiceAccountToken struct {
 	ProjectID       string            `json:"projectId,omitempty" yaml:"projectId,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
 	Token           string            `json:"token,omitempty" yaml:"token,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type ServiceAccountTokenCollection struct {
 	types.Collection
 	Data   []ServiceAccountToken `json:"data,omitempty"`
@@ -53,8 +54,10 @@ type ServiceAccountTokenClient struct {
 
 type ServiceAccountTokenOperations interface {
 	List(opts *types.ListOpts) (*ServiceAccountTokenCollection, error)
+	ListAll(opts *types.ListOpts) (*ServiceAccountTokenCollection, error)
 	Create(opts *ServiceAccountToken) (*ServiceAccountToken, error)
 	Update(existing *ServiceAccountToken, updates interface{}) (*ServiceAccountToken, error)
+	Replace(existing *ServiceAccountToken) (*ServiceAccountToken, error)
 	ByID(id string) (*ServiceAccountToken, error)
 	Delete(container *ServiceAccountToken) error
 }
@@ -77,10 +80,34 @@ func (c *ServiceAccountTokenClient) Update(existing *ServiceAccountToken, update
 	return resp, err
 }
 
+func (c *ServiceAccountTokenClient) Replace(obj *ServiceAccountToken) (*ServiceAccountToken, error) {
+	resp := &ServiceAccountToken{}
+	err := c.apiClient.Ops.DoReplace(ServiceAccountTokenType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *ServiceAccountTokenClient) List(opts *types.ListOpts) (*ServiceAccountTokenCollection, error) {
 	resp := &ServiceAccountTokenCollection{}
 	err := c.apiClient.Ops.DoList(ServiceAccountTokenType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *ServiceAccountTokenClient) ListAll(opts *types.ListOpts) (*ServiceAccountTokenCollection, error) {
+	resp := &ServiceAccountTokenCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

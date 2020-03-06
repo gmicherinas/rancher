@@ -18,6 +18,9 @@ package workqueue
 
 import (
 	"sync"
+	"time"
+
+	"k8s.io/apimachinery/pkg/util/clock"
 )
 
 type Interface interface {
@@ -35,13 +38,30 @@ func New() *Type {
 }
 
 func NewNamed(name string) *Type {
-	return &Type{
-		dirty:      set{},
-		processing: set{},
-		cond:       sync.NewCond(&sync.Mutex{}),
-		metrics:    newQueueMetrics(name),
-	}
+	rc := clock.RealClock{}
+	return newQueue(
+		rc,
+		globalMetricsFactory.newQueueMetrics(name, rc),
+		defaultUnfinishedWorkUpdatePeriod,
+	)
 }
+
+func newQueue(c clock.Clock, metrics queueMetrics, updatePeriod time.Duration) *Type {
+	t := &Type{
+		clock:                      c,
+		dirty:                      set{},
+		processing:                 set{},
+		cond:                       sync.NewCond(&sync.Mutex{}),
+		metrics:                    metrics,
+		unfinishedWorkUpdatePeriod: updatePeriod,
+	}
+	// When we scale to 1000's of clusters we end up spending a large percentage of
+	// our time waking up and doing nothing across 10s of thousands of goroutines.
+	// go t.updateUnfinishedWorkLoop()
+	return t
+}
+
+const defaultUnfinishedWorkUpdatePeriod = 500 * time.Millisecond
 
 // Type is a work queue (see the package comment).
 type Type struct {
@@ -64,6 +84,9 @@ type Type struct {
 	shuttingDown bool
 
 	metrics queueMetrics
+
+	unfinishedWorkUpdatePeriod time.Duration
+	clock                      clock.Clock
 }
 
 type empty struct{}
@@ -169,4 +192,23 @@ func (q *Type) ShuttingDown() bool {
 	defer q.cond.L.Unlock()
 
 	return q.shuttingDown
+}
+
+func (q *Type) updateUnfinishedWorkLoop() {
+	t := q.clock.NewTicker(q.unfinishedWorkUpdatePeriod)
+	defer t.Stop()
+	for range t.C() {
+		if !func() bool {
+			q.cond.L.Lock()
+			defer q.cond.L.Unlock()
+			if !q.shuttingDown {
+				q.metrics.updateUnfinishedWork()
+				return true
+			}
+			return false
+
+		}() {
+			return
+		}
+	}
 }

@@ -2,7 +2,7 @@ package api
 
 import (
 	"net/http"
-
+	"runtime/debug"
 	"sync"
 
 	"github.com/rancher/norman/api/access"
@@ -11,9 +11,11 @@ import (
 	"github.com/rancher/norman/api/writer"
 	"github.com/rancher/norman/authorization"
 	"github.com/rancher/norman/httperror"
+	ehandler "github.com/rancher/norman/httperror/handler"
 	"github.com/rancher/norman/parse"
 	"github.com/rancher/norman/store/wrapper"
 	"github.com/rancher/norman/types"
+	"github.com/sirupsen/logrus"
 )
 
 type StoreWrapper func(types.Store) types.Store
@@ -50,8 +52,20 @@ func NewAPIServer() *Server {
 	s := &Server{
 		Schemas: types.NewSchemas(),
 		ResponseWriters: map[string]ResponseWriter{
-			"json": &writer.JSONResponseWriter{},
-			"html": &writer.HTMLResponseWriter{},
+			"json": &writer.EncodingResponseWriter{
+				ContentType: "application/json",
+				Encoder:     types.JSONEncoder,
+			},
+			"html": &writer.HTMLResponseWriter{
+				EncodingResponseWriter: writer.EncodingResponseWriter{
+					Encoder:     types.JSONEncoder,
+					ContentType: "application/json",
+				},
+			},
+			"yaml": &writer.EncodingResponseWriter{
+				ContentType: "application/yaml",
+				Encoder:     types.YAMLEncoder,
+			},
 		},
 		SubContextAttributeProvider: &parse.DefaultSubContextAttributeProvider{},
 		Resolver:                    parse.DefaultResolver,
@@ -64,7 +78,7 @@ func NewAPIServer() *Server {
 			LinkHandler: func(*types.APIContext, types.RequestHandler) error {
 				return httperror.NewAPIError(httperror.NotFound, "Link not found")
 			},
-			ErrorHandler: httperror.ErrorHandler,
+			ErrorHandler: ehandler.ErrorHandler,
 		},
 		StoreWrapper: wrapper.Wrap,
 		URLParser:    parse.DefaultURLParser,
@@ -156,6 +170,13 @@ func (s *Server) setupDefaults(schema *types.Schema) {
 }
 
 func (s *Server) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	defer func() {
+		if err := recover(); err != nil && err != http.ErrAbortHandler {
+			logrus.Error("Panic serving api request: \n" + string(debug.Stack()))
+			rw.WriteHeader(http.StatusInternalServerError)
+		}
+	}()
+
 	if apiResponse, err := s.handle(rw, req); err != nil {
 		s.handleError(apiResponse, err)
 	}
@@ -187,31 +208,31 @@ func (s *Server) handle(rw http.ResponseWriter, req *http.Request) (*types.APICo
 			switch apiRequest.Method {
 			case http.MethodGet:
 				if apiRequest.ID == "" {
-					if !apiRequest.AccessControl.CanList(apiRequest, apiRequest.Schema) {
-						return apiRequest, httperror.NewAPIError(httperror.PermissionDenied, "Can not list "+apiRequest.Schema.ID)
+					if err := apiRequest.AccessControl.CanList(apiRequest, apiRequest.Schema); err != nil {
+						return apiRequest, err
 					}
 				} else {
-					if !apiRequest.AccessControl.CanGet(apiRequest, apiRequest.Schema) {
-						return apiRequest, httperror.NewAPIError(httperror.PermissionDenied, "Can not get "+apiRequest.Schema.ID)
+					if err := apiRequest.AccessControl.CanGet(apiRequest, apiRequest.Schema); err != nil {
+						return apiRequest, err
 					}
 				}
 				handler = apiRequest.Schema.ListHandler
 				nextHandler = s.Defaults.ListHandler
 			case http.MethodPost:
-				if !apiRequest.AccessControl.CanCreate(apiRequest, apiRequest.Schema) {
-					return apiRequest, httperror.NewAPIError(httperror.PermissionDenied, "Can not create "+apiRequest.Schema.ID)
+				if err := apiRequest.AccessControl.CanCreate(apiRequest, apiRequest.Schema); err != nil {
+					return apiRequest, err
 				}
 				handler = apiRequest.Schema.CreateHandler
 				nextHandler = s.Defaults.CreateHandler
 			case http.MethodPut:
-				if !apiRequest.AccessControl.CanUpdate(apiRequest, nil, apiRequest.Schema) {
-					return apiRequest, httperror.NewAPIError(httperror.PermissionDenied, "Can not update "+apiRequest.Schema.ID)
+				if err := apiRequest.AccessControl.CanUpdate(apiRequest, nil, apiRequest.Schema); err != nil {
+					return apiRequest, err
 				}
 				handler = apiRequest.Schema.UpdateHandler
 				nextHandler = s.Defaults.UpdateHandler
 			case http.MethodDelete:
-				if !apiRequest.AccessControl.CanDelete(apiRequest, nil, apiRequest.Schema) {
-					return apiRequest, httperror.NewAPIError(httperror.PermissionDenied, "Can not delete "+apiRequest.Schema.ID)
+				if err := apiRequest.AccessControl.CanDelete(apiRequest, nil, apiRequest.Schema); err != nil {
+					return apiRequest, err
 				}
 				handler = apiRequest.Schema.DeleteHandler
 				nextHandler = s.Defaults.DeleteHandler
@@ -248,4 +269,18 @@ func (s *Server) handleError(apiRequest *types.APIContext, err error) {
 	} else if apiRequest.Schema.ErrorHandler != nil {
 		apiRequest.Schema.ErrorHandler(apiRequest, err)
 	}
+}
+
+func (s *Server) CustomAPIUIResponseWriter(cssURL, jsURL, version writer.StringGetter) {
+	wi, ok := s.ResponseWriters["html"]
+	if !ok {
+		return
+	}
+	w, ok := wi.(*writer.HTMLResponseWriter)
+	if !ok {
+		return
+	}
+	w.CSSURL = cssURL
+	w.JSURL = jsURL
+	w.APIUIVersion = version
 }

@@ -1,46 +1,108 @@
 package constant
 
-const (
-	LoggingNamespace   = "cattle-logging"
-	ClusterLoggingName = "cluster-logging"
-	ProjectLoggingName = "project-logging"
+import (
+	"fmt"
+
+	cutils "github.com/rancher/rancher/pkg/catalog/utils"
 )
 
-//daemonset
 const (
-	FluentdName        = "fluentd"
-	FluentdHelperName  = "fluentd-helper"
-	FluentdHelperImage = "rancher/fluentd-helper:v0.1.1"
-	FluentdImages      = "rancher/fluentd:v0.1.4"
+	AppName        = "rancher-logging"
+	TesterAppName  = "rancher-logging-tester"
+	AppInitVersion = "initializing"
+	templateName   = "rancher-logging"
 )
 
-//embedded
 const (
-	EmbeddedESName     = "elasticsearch"
-	EmbeddedKibanaName = "kibana"
-	ESImage            = "rancher/docker-elasticsearch-kubernetes:5.6.2"
-	KibanaImage        = "kibana:5.6.4"
-	BusyboxImage       = "busybox"
+	LoggingNamespace = "cattle-logging"
 )
 
-//configmap
+//daemonset, pod, container name
 const (
-	ClusterFileName   = "cluster.conf"
-	ProjectFileName   = "project.conf"
-	ClusterConfigPath = "/tmp/cluster.conf"
-	ProjectConfigPath = "/tmp/project.conf"
+	FluentdName                = "fluentd"
+	FluentdHelperName          = "fluentd-helper"
+	LogAggregatorName          = "log-aggregator"
+	FluentdTesterName          = "fluentd-test"
+	FluentdTesterContainerName = "dry-run"
+)
+
+//config
+const (
+	LoggingSecretName             = "fluentd"
+	LoggingSSLSecretName          = "fluentd-ssl"
+	LoggingSecretClusterConfigKey = "cluster.conf"
+	LoggingSecretProjectConfigKey = "project.conf"
 )
 
 //target
 const (
-	Elasticsearch = "elasticsearch"
-	Splunk        = "splunk"
-	Kafka         = "kafka"
-	Embedded      = "embedded"
-	Syslog        = "syslog"
+	Elasticsearch   = "elasticsearch"
+	Splunk          = "splunk"
+	Kafka           = "kafka"
+	Syslog          = "syslog"
+	FluentForwarder = "fluentforwarder"
+	CustomTarget    = "customtarget"
 )
 
-//app label
 const (
-	LabelK8sApp = "k8s-app"
+	GoogleKubernetesEngine = "googleKubernetesEngine"
 )
+
+//ssl
+const (
+	DefaultCertDir = "/fluentd/etc/config/ssl"
+	CaFileName     = "ca.pem"
+	ClientCertName = "client-cert.pem"
+	ClientKeyName  = "client-key.pem"
+)
+
+const (
+	ClusterLevel = "cluster"
+	ProjectLevel = "project"
+)
+
+var (
+	FluentdTesterSelector = map[string]string{"app": "fluentd-tester"}
+	FluentdSelector       = map[string]string{"app": "fluentd"}
+	LogAggregatorSelector = map[string]string{"app": "log-aggregator"}
+)
+
+func SecretDataKeyCa(level, name string) string {
+	return fmt.Sprintf("%s_%s_%s", level, name, CaFileName)
+}
+
+func SecretDataKeyCert(level, name string) string {
+	return fmt.Sprintf("%s_%s_%s", level, name, ClientCertName)
+}
+
+func SecretDataKeyCertKey(level, name string) string {
+	return fmt.Sprintf("%s_%s_%s", level, name, ClientKeyName)
+}
+
+func RancherLoggingTemplateID() string {
+	return fmt.Sprintf("%s-%s", cutils.SystemLibraryName, templateName)
+}
+
+func RancherLoggingInitVersion() string {
+	return fmt.Sprintf("%s-%s-%s", cutils.SystemLibraryName, templateName, AppInitVersion)
+}
+
+func RancherLoggingCatalogID(version string) string {
+	return fmt.Sprintf(cutils.CatalogExternalIDFormat, cutils.SystemLibraryName, templateName, version)
+}
+
+func RancherLoggingConfigSecretName() string {
+	return fmt.Sprintf("%s-%s", AppName, LoggingSecretName)
+}
+
+func RancherLoggingSSLSecretName() string {
+	return fmt.Sprintf("%s-%s", AppName, LoggingSSLSecretName)
+}
+
+func GetNamespacePattern(namespace string) string {
+	return fmt.Sprintf("^%s$", namespace)
+}
+
+func GetNamespacePathPattern(namespace string) string {
+	return fmt.Sprintf("/var/log/containers/*_%s_*.log", namespace)
+}

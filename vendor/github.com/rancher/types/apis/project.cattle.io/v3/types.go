@@ -35,6 +35,7 @@ type RegistryCredential struct {
 	Username    string `json:"username"`
 	Password    string `json:"password" norman:"writeOnly"`
 	Auth        string `json:"auth" norman:"writeOnly"`
+	Email       string `json:"email"`
 }
 
 type Certificate struct {
@@ -85,19 +86,35 @@ type SSHAuth struct {
 type NamespacedSSHAuth SSHAuth
 
 type PublicEndpoint struct {
-	NodeName string `json:"nodeName,omitempty" norman:"type=reference[/v3/schemas/node],nocreate,noupdate"`
-	Address  string `json:"address,omitempty" norman:"nocreate,noupdate"`
-	Port     int32  `json:"port,omitempty" norman:"nocreate,noupdate"`
-	Protocol string `json:"protocol,omitempty" norman:"nocreate,noupdate"`
-	// for node port service
+	NodeName  string   `json:"nodeName,omitempty" norman:"type=reference[/v3/schemas/node],nocreate,noupdate"`
+	Addresses []string `json:"addresses,omitempty" norman:"nocreate,noupdate"`
+	Port      int32    `json:"port,omitempty" norman:"nocreate,noupdate"`
+	Protocol  string   `json:"protocol,omitempty" norman:"nocreate,noupdate"`
+	// for node port service endpoint
 	ServiceName string `json:"serviceName,omitempty" norman:"type=reference[service],nocreate,noupdate"`
-	// for host port
+	// for host port endpoint
 	PodName string `json:"podName,omitempty" norman:"type=reference[pod],nocreate,noupdate"`
-	//serviceName and podName are mutually exclusive
+	// for ingress endpoint. ServiceName, podName, ingressName are mutually exclusive
+	IngressName string `json:"ingressName,omitempty" norman:"type=reference[ingress],nocreate,noupdate"`
+	// Hostname/path are set for Ingress endpoints
+	Hostname string `json:"hostname,omitempty" norman:"nocreate,noupdate"`
+	Path     string `json:"path,omitempty" norman:"nocreate,noupdate"`
+	// True when endpoint is exposed on every node
+	AllNodes bool `json:"allNodes" norman:"nocreate,noupdate"`
 }
 
 type Workload struct {
 	types.Namespaced
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+}
+
+type DeploymentRollbackInput struct {
+	ReplicaSetID string `json:"replicaSetId" norman:"type=reference[replicaSet]"`
+}
+
+type WorkloadMetric struct {
+	Port   int32  `json:"port,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Schema string `json:"schema,omitempty" norman:"type=enum,options=HTTP|HTTPS"`
 }

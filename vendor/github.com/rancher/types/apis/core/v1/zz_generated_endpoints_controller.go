@@ -2,15 +2,18 @@ package v1
 
 import (
 	"context"
+	"time"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
-	"k8s.io/api/core/v1"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/resource"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
@@ -28,15 +31,34 @@ var (
 
 		Kind: EndpointsGroupVersionKind.Kind,
 	}
+
+	EndpointsGroupVersionResource = schema.GroupVersionResource{
+		Group:    GroupName,
+		Version:  Version,
+		Resource: "endpoints",
+	}
 )
+
+func init() {
+	resource.Put(EndpointsGroupVersionResource)
+}
+
+func NewEndpoints(namespace, name string, obj v1.Endpoints) *v1.Endpoints {
+	obj.APIVersion, obj.Kind = EndpointsGroupVersionKind.ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
 
 type EndpointsList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []v1.Endpoints
+	Items           []v1.Endpoints `json:"items"`
 }
 
-type EndpointsHandlerFunc func(key string, obj *v1.Endpoints) error
+type EndpointsHandlerFunc func(key string, obj *v1.Endpoints) (runtime.Object, error)
+
+type EndpointsChangeHandlerFunc func(obj *v1.Endpoints) (runtime.Object, error)
 
 type EndpointsLister interface {
 	List(namespace string, selector labels.Selector) (ret []*v1.Endpoints, err error)
@@ -44,17 +66,21 @@ type EndpointsLister interface {
 }
 
 type EndpointsController interface {
+	Generic() controller.GenericController
 	Informer() cache.SharedIndexInformer
 	Lister() EndpointsLister
-	AddHandler(name string, handler EndpointsHandlerFunc)
-	AddClusterScopedHandler(name, clusterName string, handler EndpointsHandlerFunc)
+	AddHandler(ctx context.Context, name string, handler EndpointsHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync EndpointsHandlerFunc)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, handler EndpointsHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, handler EndpointsHandlerFunc)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, after time.Duration)
 	Sync(ctx context.Context) error
 	Start(ctx context.Context, threadiness int) error
 }
 
 type EndpointsInterface interface {
-	ObjectClient() *clientbase.ObjectClient
+	ObjectClient() *objectclient.ObjectClient
 	Create(*v1.Endpoints) (*v1.Endpoints, error)
 	GetNamespaced(namespace, name string, opts metav1.GetOptions) (*v1.Endpoints, error)
 	Get(name string, opts metav1.GetOptions) (*v1.Endpoints, error)
@@ -62,13 +88,18 @@ type EndpointsInterface interface {
 	Delete(name string, options *metav1.DeleteOptions) error
 	DeleteNamespaced(namespace, name string, options *metav1.DeleteOptions) error
 	List(opts metav1.ListOptions) (*EndpointsList, error)
+	ListNamespaced(namespace string, opts metav1.ListOptions) (*EndpointsList, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts metav1.ListOptions) error
 	Controller() EndpointsController
-	AddHandler(name string, sync EndpointsHandlerFunc)
-	AddLifecycle(name string, lifecycle EndpointsLifecycle)
-	AddClusterScopedHandler(name, clusterName string, sync EndpointsHandlerFunc)
-	AddClusterScopedLifecycle(name, clusterName string, lifecycle EndpointsLifecycle)
+	AddHandler(ctx context.Context, name string, sync EndpointsHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync EndpointsHandlerFunc)
+	AddLifecycle(ctx context.Context, name string, lifecycle EndpointsLifecycle)
+	AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle EndpointsLifecycle)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync EndpointsHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync EndpointsHandlerFunc)
+	AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle EndpointsLifecycle)
+	AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle EndpointsLifecycle)
 }
 
 type endpointsLister struct {
@@ -97,7 +128,7 @@ func (l *endpointsLister) Get(namespace, name string) (*v1.Endpoints, error) {
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    EndpointsGroupVersionKind.Group,
 			Resource: "endpoints",
-		}, name)
+		}, key)
 	}
 	return obj.(*v1.Endpoints), nil
 }
@@ -106,40 +137,65 @@ type endpointsController struct {
 	controller.GenericController
 }
 
+func (c *endpointsController) Generic() controller.GenericController {
+	return c.GenericController
+}
+
 func (c *endpointsController) Lister() EndpointsLister {
 	return &endpointsLister{
 		controller: c,
 	}
 }
 
-func (c *endpointsController) AddHandler(name string, handler EndpointsHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *endpointsController) AddHandler(ctx context.Context, name string, handler EndpointsHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Endpoints); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
-		return handler(key, obj.(*v1.Endpoints))
 	})
 }
 
-func (c *endpointsController) AddClusterScopedHandler(name, cluster string, handler EndpointsHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *endpointsController) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, handler EndpointsHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Endpoints); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		if !controller.ObjectInCluster(cluster, obj) {
-			return nil
+func (c *endpointsController) AddClusterScopedHandler(ctx context.Context, name, cluster string, handler EndpointsHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Endpoints); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		return handler(key, obj.(*v1.Endpoints))
+func (c *endpointsController) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, cluster string, handler EndpointsHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*v1.Endpoints); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
+		}
 	})
 }
 
@@ -179,11 +235,11 @@ func (s *endpointsClient) Controller() EndpointsController {
 type endpointsClient struct {
 	client       *Client
 	ns           string
-	objectClient *clientbase.ObjectClient
+	objectClient *objectclient.ObjectClient
 	controller   EndpointsController
 }
 
-func (s *endpointsClient) ObjectClient() *clientbase.ObjectClient {
+func (s *endpointsClient) ObjectClient() *objectclient.ObjectClient {
 	return s.objectClient
 }
 
@@ -220,13 +276,18 @@ func (s *endpointsClient) List(opts metav1.ListOptions) (*EndpointsList, error) 
 	return obj.(*EndpointsList), err
 }
 
+func (s *endpointsClient) ListNamespaced(namespace string, opts metav1.ListOptions) (*EndpointsList, error) {
+	obj, err := s.objectClient.ListNamespaced(namespace, opts)
+	return obj.(*EndpointsList), err
+}
+
 func (s *endpointsClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	return s.objectClient.Watch(opts)
 }
 
 // Patch applies the patch and returns the patched deployment.
-func (s *endpointsClient) Patch(o *v1.Endpoints, data []byte, subresources ...string) (*v1.Endpoints, error) {
-	obj, err := s.objectClient.Patch(o.Name, o, data, subresources...)
+func (s *endpointsClient) Patch(o *v1.Endpoints, patchType types.PatchType, data []byte, subresources ...string) (*v1.Endpoints, error) {
+	obj, err := s.objectClient.Patch(o.Name, o, patchType, data, subresources...)
 	return obj.(*v1.Endpoints), err
 }
 
@@ -234,20 +295,38 @@ func (s *endpointsClient) DeleteCollection(deleteOpts *metav1.DeleteOptions, lis
 	return s.objectClient.DeleteCollection(deleteOpts, listOpts)
 }
 
-func (s *endpointsClient) AddHandler(name string, sync EndpointsHandlerFunc) {
-	s.Controller().AddHandler(name, sync)
+func (s *endpointsClient) AddHandler(ctx context.Context, name string, sync EndpointsHandlerFunc) {
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *endpointsClient) AddLifecycle(name string, lifecycle EndpointsLifecycle) {
+func (s *endpointsClient) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync EndpointsHandlerFunc) {
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
+}
+
+func (s *endpointsClient) AddLifecycle(ctx context.Context, name string, lifecycle EndpointsLifecycle) {
 	sync := NewEndpointsLifecycleAdapter(name, false, s, lifecycle)
-	s.AddHandler(name, sync)
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *endpointsClient) AddClusterScopedHandler(name, clusterName string, sync EndpointsHandlerFunc) {
-	s.Controller().AddClusterScopedHandler(name, clusterName, sync)
+func (s *endpointsClient) AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle EndpointsLifecycle) {
+	sync := NewEndpointsLifecycleAdapter(name, false, s, lifecycle)
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
 }
 
-func (s *endpointsClient) AddClusterScopedLifecycle(name, clusterName string, lifecycle EndpointsLifecycle) {
+func (s *endpointsClient) AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync EndpointsHandlerFunc) {
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *endpointsClient) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync EndpointsHandlerFunc) {
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
+}
+
+func (s *endpointsClient) AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle EndpointsLifecycle) {
 	sync := NewEndpointsLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
-	s.AddClusterScopedHandler(name, clusterName, sync)
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *endpointsClient) AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle EndpointsLifecycle) {
+	sync := NewEndpointsLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
 }

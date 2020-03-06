@@ -2,15 +2,18 @@ package v1
 
 import (
 	"context"
+	"time"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
-	"k8s.io/api/core/v1"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/resource"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
@@ -28,15 +31,34 @@ var (
 
 		Kind: ConfigMapGroupVersionKind.Kind,
 	}
+
+	ConfigMapGroupVersionResource = schema.GroupVersionResource{
+		Group:    GroupName,
+		Version:  Version,
+		Resource: "configmaps",
+	}
 )
+
+func init() {
+	resource.Put(ConfigMapGroupVersionResource)
+}
+
+func NewConfigMap(namespace, name string, obj v1.ConfigMap) *v1.ConfigMap {
+	obj.APIVersion, obj.Kind = ConfigMapGroupVersionKind.ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
 
 type ConfigMapList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []v1.ConfigMap
+	Items           []v1.ConfigMap `json:"items"`
 }
 
-type ConfigMapHandlerFunc func(key string, obj *v1.ConfigMap) error
+type ConfigMapHandlerFunc func(key string, obj *v1.ConfigMap) (runtime.Object, error)
+
+type ConfigMapChangeHandlerFunc func(obj *v1.ConfigMap) (runtime.Object, error)
 
 type ConfigMapLister interface {
 	List(namespace string, selector labels.Selector) (ret []*v1.ConfigMap, err error)
@@ -44,17 +66,21 @@ type ConfigMapLister interface {
 }
 
 type ConfigMapController interface {
+	Generic() controller.GenericController
 	Informer() cache.SharedIndexInformer
 	Lister() ConfigMapLister
-	AddHandler(name string, handler ConfigMapHandlerFunc)
-	AddClusterScopedHandler(name, clusterName string, handler ConfigMapHandlerFunc)
+	AddHandler(ctx context.Context, name string, handler ConfigMapHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync ConfigMapHandlerFunc)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, handler ConfigMapHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, handler ConfigMapHandlerFunc)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, after time.Duration)
 	Sync(ctx context.Context) error
 	Start(ctx context.Context, threadiness int) error
 }
 
 type ConfigMapInterface interface {
-	ObjectClient() *clientbase.ObjectClient
+	ObjectClient() *objectclient.ObjectClient
 	Create(*v1.ConfigMap) (*v1.ConfigMap, error)
 	GetNamespaced(namespace, name string, opts metav1.GetOptions) (*v1.ConfigMap, error)
 	Get(name string, opts metav1.GetOptions) (*v1.ConfigMap, error)
@@ -62,13 +88,18 @@ type ConfigMapInterface interface {
 	Delete(name string, options *metav1.DeleteOptions) error
 	DeleteNamespaced(namespace, name string, options *metav1.DeleteOptions) error
 	List(opts metav1.ListOptions) (*ConfigMapList, error)
+	ListNamespaced(namespace string, opts metav1.ListOptions) (*ConfigMapList, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts metav1.ListOptions) error
 	Controller() ConfigMapController
-	AddHandler(name string, sync ConfigMapHandlerFunc)
-	AddLifecycle(name string, lifecycle ConfigMapLifecycle)
-	AddClusterScopedHandler(name, clusterName string, sync ConfigMapHandlerFunc)
-	AddClusterScopedLifecycle(name, clusterName string, lifecycle ConfigMapLifecycle)
+	AddHandler(ctx context.Context, name string, sync ConfigMapHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync ConfigMapHandlerFunc)
+	AddLifecycle(ctx context.Context, name string, lifecycle ConfigMapLifecycle)
+	AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle ConfigMapLifecycle)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync ConfigMapHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync ConfigMapHandlerFunc)
+	AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle ConfigMapLifecycle)
+	AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle ConfigMapLifecycle)
 }
 
 type configMapLister struct {
@@ -97,7 +128,7 @@ func (l *configMapLister) Get(namespace, name string) (*v1.ConfigMap, error) {
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    ConfigMapGroupVersionKind.Group,
 			Resource: "configMap",
-		}, name)
+		}, key)
 	}
 	return obj.(*v1.ConfigMap), nil
 }
@@ -106,40 +137,65 @@ type configMapController struct {
 	controller.GenericController
 }
 
+func (c *configMapController) Generic() controller.GenericController {
+	return c.GenericController
+}
+
 func (c *configMapController) Lister() ConfigMapLister {
 	return &configMapLister{
 		controller: c,
 	}
 }
 
-func (c *configMapController) AddHandler(name string, handler ConfigMapHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *configMapController) AddHandler(ctx context.Context, name string, handler ConfigMapHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*v1.ConfigMap); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
-		return handler(key, obj.(*v1.ConfigMap))
 	})
 }
 
-func (c *configMapController) AddClusterScopedHandler(name, cluster string, handler ConfigMapHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *configMapController) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, handler ConfigMapHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*v1.ConfigMap); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		if !controller.ObjectInCluster(cluster, obj) {
-			return nil
+func (c *configMapController) AddClusterScopedHandler(ctx context.Context, name, cluster string, handler ConfigMapHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*v1.ConfigMap); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		return handler(key, obj.(*v1.ConfigMap))
+func (c *configMapController) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, cluster string, handler ConfigMapHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*v1.ConfigMap); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
+		}
 	})
 }
 
@@ -179,11 +235,11 @@ func (s *configMapClient) Controller() ConfigMapController {
 type configMapClient struct {
 	client       *Client
 	ns           string
-	objectClient *clientbase.ObjectClient
+	objectClient *objectclient.ObjectClient
 	controller   ConfigMapController
 }
 
-func (s *configMapClient) ObjectClient() *clientbase.ObjectClient {
+func (s *configMapClient) ObjectClient() *objectclient.ObjectClient {
 	return s.objectClient
 }
 
@@ -220,13 +276,18 @@ func (s *configMapClient) List(opts metav1.ListOptions) (*ConfigMapList, error) 
 	return obj.(*ConfigMapList), err
 }
 
+func (s *configMapClient) ListNamespaced(namespace string, opts metav1.ListOptions) (*ConfigMapList, error) {
+	obj, err := s.objectClient.ListNamespaced(namespace, opts)
+	return obj.(*ConfigMapList), err
+}
+
 func (s *configMapClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	return s.objectClient.Watch(opts)
 }
 
 // Patch applies the patch and returns the patched deployment.
-func (s *configMapClient) Patch(o *v1.ConfigMap, data []byte, subresources ...string) (*v1.ConfigMap, error) {
-	obj, err := s.objectClient.Patch(o.Name, o, data, subresources...)
+func (s *configMapClient) Patch(o *v1.ConfigMap, patchType types.PatchType, data []byte, subresources ...string) (*v1.ConfigMap, error) {
+	obj, err := s.objectClient.Patch(o.Name, o, patchType, data, subresources...)
 	return obj.(*v1.ConfigMap), err
 }
 
@@ -234,20 +295,38 @@ func (s *configMapClient) DeleteCollection(deleteOpts *metav1.DeleteOptions, lis
 	return s.objectClient.DeleteCollection(deleteOpts, listOpts)
 }
 
-func (s *configMapClient) AddHandler(name string, sync ConfigMapHandlerFunc) {
-	s.Controller().AddHandler(name, sync)
+func (s *configMapClient) AddHandler(ctx context.Context, name string, sync ConfigMapHandlerFunc) {
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *configMapClient) AddLifecycle(name string, lifecycle ConfigMapLifecycle) {
+func (s *configMapClient) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync ConfigMapHandlerFunc) {
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
+}
+
+func (s *configMapClient) AddLifecycle(ctx context.Context, name string, lifecycle ConfigMapLifecycle) {
 	sync := NewConfigMapLifecycleAdapter(name, false, s, lifecycle)
-	s.AddHandler(name, sync)
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *configMapClient) AddClusterScopedHandler(name, clusterName string, sync ConfigMapHandlerFunc) {
-	s.Controller().AddClusterScopedHandler(name, clusterName, sync)
+func (s *configMapClient) AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle ConfigMapLifecycle) {
+	sync := NewConfigMapLifecycleAdapter(name, false, s, lifecycle)
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
 }
 
-func (s *configMapClient) AddClusterScopedLifecycle(name, clusterName string, lifecycle ConfigMapLifecycle) {
+func (s *configMapClient) AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync ConfigMapHandlerFunc) {
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *configMapClient) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync ConfigMapHandlerFunc) {
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
+}
+
+func (s *configMapClient) AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle ConfigMapLifecycle) {
 	sync := NewConfigMapLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
-	s.AddClusterScopedHandler(name, clusterName, sync)
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *configMapClient) AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle ConfigMapLifecycle) {
+	sync := NewConfigMapLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
 }

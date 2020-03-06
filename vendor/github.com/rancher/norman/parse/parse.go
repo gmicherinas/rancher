@@ -23,6 +23,7 @@ var (
 	allowedFormats   = map[string]bool{
 		"html": true,
 		"json": true,
+		"yaml": true,
 	}
 )
 
@@ -129,6 +130,12 @@ func Parse(rw http.ResponseWriter, req *http.Request, schemas *types.Schemas, ur
 		return result, err
 	}
 
+	if schema := result.Schema; schema.Enabled != nil {
+		if !schema.Enabled() {
+			return result, httperror.NewAPIError(httperror.ActionNotAvailable, "schema disabled "+schema.ID)
+		}
+	}
+
 	result.Type = result.Schema.ID
 
 	if err := ValidateMethod(result); err != nil {
@@ -142,7 +149,11 @@ func versionsForPath(schemas *types.Schemas, path string) []types.APIVersion {
 	var matchedVersion []types.APIVersion
 	for _, version := range schemas.Versions() {
 		if strings.HasPrefix(path, version.Path) {
-			matchedVersion = append(matchedVersion, version)
+			afterPath := path[len(version.Path):]
+			// if version.Path is /v3/cluster allow /v3/clusters but not /v3/clusterstuff
+			if len(afterPath) < 3 || strings.Contains(afterPath[:3], "/") {
+				matchedVersion = append(matchedVersion, version)
+			}
 		}
 	}
 	sort.Slice(matchedVersion, func(i, j int) bool {
@@ -255,7 +266,15 @@ func parseResponseFormat(req *http.Request) string {
 	if IsBrowser(req, true) {
 		return "html"
 	}
+
+	if isYaml(req) {
+		return "yaml"
+	}
 	return "json"
+}
+
+func isYaml(req *http.Request) bool {
+	return strings.Contains(req.Header.Get("Accept"), "application/yaml")
 }
 
 func parseMethod(req *http.Request) string {
@@ -281,7 +300,7 @@ func Body(req *http.Request) (map[string]interface{}, error) {
 		return valuesToBody(req.MultipartForm.Value), nil
 	}
 
-	if req.Form != nil && len(req.Form) > 0 {
+	if req.PostForm != nil && len(req.PostForm) > 0 {
 		return valuesToBody(map[string][]string(req.Form)), nil
 	}
 

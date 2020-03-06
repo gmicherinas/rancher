@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	exprRegexp = regexp.MustCompile("^(.*)(=|!=|<|>| in | notin )(.*)$")
+	exprRegexp = regexp.MustCompile("^(.*?)\\s*(=|!=|<|>| in | notin )\\s*(.*)$")
 )
 
 type SchedulingMapper struct {
@@ -95,7 +95,7 @@ func (s SchedulingMapper) nodeAffinity(data map[string]interface{}, nodeAffinity
 		values.PutValue(data, requireAny, "scheduling", "node", "requireAny")
 	}
 	if len(preferred) > 0 {
-		values.PutValue(data, requireAny, "scheduling", "node", "preferred")
+		values.PutValue(data, preferred, "scheduling", "node", "preferred")
 	}
 }
 
@@ -192,7 +192,7 @@ func StringsToNodeSelectorTerm(exprs []string) []v1.NodeSelectorTerm {
 	return result
 }
 
-func (s SchedulingMapper) ToInternal(data map[string]interface{}) {
+func (s SchedulingMapper) ToInternal(data map[string]interface{}) error {
 	defer func() {
 		delete(data, "scheduling")
 	}()
@@ -202,12 +202,21 @@ func (s SchedulingMapper) ToInternal(data map[string]interface{}) {
 		data["nodeName"] = nodeName
 	}
 
-	requireAll := convert.ToStringSlice(values.GetValueN(data, "scheduling", "node", "requireAll"))
-	requireAny := convert.ToStringSlice(values.GetValueN(data, "scheduling", "node", "requireAny"))
-	preferred := convert.ToStringSlice(values.GetValueN(data, "scheduling", "node", "preferred"))
+	requireAllV := values.GetValueN(data, "scheduling", "node", "requireAll")
+	requireAnyV := values.GetValueN(data, "scheduling", "node", "requireAny")
+	preferredV := values.GetValueN(data, "scheduling", "node", "preferred")
+
+	if requireAllV == nil && requireAnyV == nil && preferredV == nil {
+		return nil
+	}
+
+	requireAll := convert.ToStringSlice(requireAllV)
+	requireAny := convert.ToStringSlice(requireAnyV)
+	preferred := convert.ToStringSlice(preferredV)
 
 	if len(requireAll) == 0 && len(requireAny) == 0 && len(preferred) == 0 {
-		return
+		values.PutValue(data, nil, "affinity", "nodeAffinity")
+		return nil
 	}
 
 	nodeAffinity := v1.NodeAffinity{}
@@ -243,7 +252,17 @@ func (s SchedulingMapper) ToInternal(data map[string]interface{}) {
 		NodeAffinity: &nodeAffinity,
 	})
 
+	if nodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution == nil {
+		values.PutValue(affinity, nil, "nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution")
+	}
+
+	if nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		values.PutValue(affinity, nil, "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution")
+	}
+
 	data["affinity"] = affinity
+
+	return nil
 }
 
 func AggregateTerms(terms []v1.NodeSelectorTerm) v1.NodeSelectorTerm {

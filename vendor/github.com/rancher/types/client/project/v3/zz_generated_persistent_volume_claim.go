@@ -10,6 +10,7 @@ const (
 	PersistentVolumeClaimFieldAnnotations          = "annotations"
 	PersistentVolumeClaimFieldCreated              = "created"
 	PersistentVolumeClaimFieldCreatorID            = "creatorId"
+	PersistentVolumeClaimFieldDataSource           = "dataSource"
 	PersistentVolumeClaimFieldLabels               = "labels"
 	PersistentVolumeClaimFieldName                 = "name"
 	PersistentVolumeClaimFieldNamespaceId          = "namespaceId"
@@ -20,11 +21,12 @@ const (
 	PersistentVolumeClaimFieldSelector             = "selector"
 	PersistentVolumeClaimFieldState                = "state"
 	PersistentVolumeClaimFieldStatus               = "status"
-	PersistentVolumeClaimFieldStorageClassId       = "storageClassId"
+	PersistentVolumeClaimFieldStorageClassID       = "storageClassId"
 	PersistentVolumeClaimFieldTransitioning        = "transitioning"
 	PersistentVolumeClaimFieldTransitioningMessage = "transitioningMessage"
-	PersistentVolumeClaimFieldUuid                 = "uuid"
-	PersistentVolumeClaimFieldVolumeId             = "volumeId"
+	PersistentVolumeClaimFieldUUID                 = "uuid"
+	PersistentVolumeClaimFieldVolumeID             = "volumeId"
+	PersistentVolumeClaimFieldVolumeMode           = "volumeMode"
 )
 
 type PersistentVolumeClaim struct {
@@ -33,6 +35,7 @@ type PersistentVolumeClaim struct {
 	Annotations          map[string]string            `json:"annotations,omitempty" yaml:"annotations,omitempty"`
 	Created              string                       `json:"created,omitempty" yaml:"created,omitempty"`
 	CreatorID            string                       `json:"creatorId,omitempty" yaml:"creatorId,omitempty"`
+	DataSource           *TypedLocalObjectReference   `json:"dataSource,omitempty" yaml:"dataSource,omitempty"`
 	Labels               map[string]string            `json:"labels,omitempty" yaml:"labels,omitempty"`
 	Name                 string                       `json:"name,omitempty" yaml:"name,omitempty"`
 	NamespaceId          string                       `json:"namespaceId,omitempty" yaml:"namespaceId,omitempty"`
@@ -43,12 +46,14 @@ type PersistentVolumeClaim struct {
 	Selector             *LabelSelector               `json:"selector,omitempty" yaml:"selector,omitempty"`
 	State                string                       `json:"state,omitempty" yaml:"state,omitempty"`
 	Status               *PersistentVolumeClaimStatus `json:"status,omitempty" yaml:"status,omitempty"`
-	StorageClassId       string                       `json:"storageClassId,omitempty" yaml:"storageClassId,omitempty"`
+	StorageClassID       string                       `json:"storageClassId,omitempty" yaml:"storageClassId,omitempty"`
 	Transitioning        string                       `json:"transitioning,omitempty" yaml:"transitioning,omitempty"`
 	TransitioningMessage string                       `json:"transitioningMessage,omitempty" yaml:"transitioningMessage,omitempty"`
-	Uuid                 string                       `json:"uuid,omitempty" yaml:"uuid,omitempty"`
-	VolumeId             string                       `json:"volumeId,omitempty" yaml:"volumeId,omitempty"`
+	UUID                 string                       `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	VolumeID             string                       `json:"volumeId,omitempty" yaml:"volumeId,omitempty"`
+	VolumeMode           string                       `json:"volumeMode,omitempty" yaml:"volumeMode,omitempty"`
 }
+
 type PersistentVolumeClaimCollection struct {
 	types.Collection
 	Data   []PersistentVolumeClaim `json:"data,omitempty"`
@@ -61,8 +66,10 @@ type PersistentVolumeClaimClient struct {
 
 type PersistentVolumeClaimOperations interface {
 	List(opts *types.ListOpts) (*PersistentVolumeClaimCollection, error)
+	ListAll(opts *types.ListOpts) (*PersistentVolumeClaimCollection, error)
 	Create(opts *PersistentVolumeClaim) (*PersistentVolumeClaim, error)
 	Update(existing *PersistentVolumeClaim, updates interface{}) (*PersistentVolumeClaim, error)
+	Replace(existing *PersistentVolumeClaim) (*PersistentVolumeClaim, error)
 	ByID(id string) (*PersistentVolumeClaim, error)
 	Delete(container *PersistentVolumeClaim) error
 }
@@ -85,10 +92,34 @@ func (c *PersistentVolumeClaimClient) Update(existing *PersistentVolumeClaim, up
 	return resp, err
 }
 
+func (c *PersistentVolumeClaimClient) Replace(obj *PersistentVolumeClaim) (*PersistentVolumeClaim, error) {
+	resp := &PersistentVolumeClaim{}
+	err := c.apiClient.Ops.DoReplace(PersistentVolumeClaimType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *PersistentVolumeClaimClient) List(opts *types.ListOpts) (*PersistentVolumeClaimCollection, error) {
 	resp := &PersistentVolumeClaimCollection{}
 	err := c.apiClient.Ops.DoList(PersistentVolumeClaimType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *PersistentVolumeClaimClient) ListAll(opts *types.ListOpts) (*PersistentVolumeClaimCollection, error) {
+	resp := &PersistentVolumeClaimCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

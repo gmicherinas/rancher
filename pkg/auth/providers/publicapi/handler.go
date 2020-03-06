@@ -4,9 +4,9 @@ import (
 	"context"
 	"net/http"
 
-	normanapi "github.com/rancher/norman/api"
 	"github.com/rancher/norman/store/subtype"
 	"github.com/rancher/norman/types"
+	rancherapi "github.com/rancher/rancher/pkg/api"
 	publicSchema "github.com/rancher/types/apis/management.cattle.io/v3public/schema"
 	v3public "github.com/rancher/types/client/management/v3public"
 	"github.com/rancher/types/config"
@@ -18,19 +18,28 @@ func NewHandler(ctx context.Context, mgmtCtx *config.ScaledContext) (http.Handle
 		return nil, err
 	}
 
-	server := normanapi.NewAPIServer()
-	if err := server.AddSchemas(schemas); err != nil {
-		return nil, err
-	}
-	return server, nil
+	return rancherapi.NewServer(schemas)
 }
 
-var authProviderTypes = []string{v3public.LocalProviderType, v3public.GithubProviderType, v3public.ActiveDirectoryProviderType}
+var authProviderTypes = []string{
+	v3public.ActiveDirectoryProviderType,
+	v3public.AzureADProviderType,
+	v3public.GithubProviderType,
+	v3public.LocalProviderType,
+	v3public.OpenLdapProviderType,
+	v3public.FreeIpaProviderType,
+	v3public.PingProviderType,
+	v3public.ADFSProviderType,
+	v3public.KeyCloakProviderType,
+	v3public.OKTAProviderType,
+	v3public.ShibbolethProviderType,
+	v3public.GoogleOAuthProviderType,
+}
 
 func authProviderSchemas(ctx context.Context, management *config.ScaledContext, schemas *types.Schemas) error {
 	schema := schemas.Schema(&publicSchema.PublicVersion, v3public.AuthProviderType)
 	setAuthProvidersStore(schema, management)
-	lh := newLoginHandler(management)
+	lh := newLoginHandler(ctx, management)
 
 	for _, apSubtype := range authProviderTypes {
 		subSchema := schemas.Schema(&publicSchema.PublicVersion, apSubtype)

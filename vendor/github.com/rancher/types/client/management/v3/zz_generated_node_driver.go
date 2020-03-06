@@ -24,7 +24,8 @@ const (
 	NodeDriverFieldTransitioningMessage = "transitioningMessage"
 	NodeDriverFieldUIURL                = "uiUrl"
 	NodeDriverFieldURL                  = "url"
-	NodeDriverFieldUuid                 = "uuid"
+	NodeDriverFieldUUID                 = "uuid"
+	NodeDriverFieldWhitelistDomains     = "whitelistDomains"
 )
 
 type NodeDriver struct {
@@ -47,8 +48,10 @@ type NodeDriver struct {
 	TransitioningMessage string            `json:"transitioningMessage,omitempty" yaml:"transitioningMessage,omitempty"`
 	UIURL                string            `json:"uiUrl,omitempty" yaml:"uiUrl,omitempty"`
 	URL                  string            `json:"url,omitempty" yaml:"url,omitempty"`
-	Uuid                 string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                 string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	WhitelistDomains     []string          `json:"whitelistDomains,omitempty" yaml:"whitelistDomains,omitempty"`
 }
+
 type NodeDriverCollection struct {
 	types.Collection
 	Data   []NodeDriver `json:"data,omitempty"`
@@ -61,14 +64,16 @@ type NodeDriverClient struct {
 
 type NodeDriverOperations interface {
 	List(opts *types.ListOpts) (*NodeDriverCollection, error)
+	ListAll(opts *types.ListOpts) (*NodeDriverCollection, error)
 	Create(opts *NodeDriver) (*NodeDriver, error)
 	Update(existing *NodeDriver, updates interface{}) (*NodeDriver, error)
+	Replace(existing *NodeDriver) (*NodeDriver, error)
 	ByID(id string) (*NodeDriver, error)
 	Delete(container *NodeDriver) error
 
-	ActionActivate(*NodeDriver) (*NodeDriver, error)
+	ActionActivate(resource *NodeDriver) (*NodeDriver, error)
 
-	ActionDeactivate(*NodeDriver) (*NodeDriver, error)
+	ActionDeactivate(resource *NodeDriver) (*NodeDriver, error)
 }
 
 func newNodeDriverClient(apiClient *Client) *NodeDriverClient {
@@ -89,10 +94,34 @@ func (c *NodeDriverClient) Update(existing *NodeDriver, updates interface{}) (*N
 	return resp, err
 }
 
+func (c *NodeDriverClient) Replace(obj *NodeDriver) (*NodeDriver, error) {
+	resp := &NodeDriver{}
+	err := c.apiClient.Ops.DoReplace(NodeDriverType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *NodeDriverClient) List(opts *types.ListOpts) (*NodeDriverCollection, error) {
 	resp := &NodeDriverCollection{}
 	err := c.apiClient.Ops.DoList(NodeDriverType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *NodeDriverClient) ListAll(opts *types.ListOpts) (*NodeDriverCollection, error) {
+	resp := &NodeDriverCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 
@@ -117,19 +146,13 @@ func (c *NodeDriverClient) Delete(container *NodeDriver) error {
 }
 
 func (c *NodeDriverClient) ActionActivate(resource *NodeDriver) (*NodeDriver, error) {
-
 	resp := &NodeDriver{}
-
 	err := c.apiClient.Ops.DoAction(NodeDriverType, "activate", &resource.Resource, nil, resp)
-
 	return resp, err
 }
 
 func (c *NodeDriverClient) ActionDeactivate(resource *NodeDriver) (*NodeDriver, error) {
-
 	resp := &NodeDriver{}
-
 	err := c.apiClient.Ops.DoAction(NodeDriverType, "deactivate", &resource.Resource, nil, resp)
-
 	return resp, err
 }

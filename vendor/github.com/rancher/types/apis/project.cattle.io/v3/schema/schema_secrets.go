@@ -4,8 +4,8 @@ import (
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
 	m "github.com/rancher/norman/types/mapper"
-	"github.com/rancher/types/apis/project.cattle.io/v3"
-	"k8s.io/api/core/v1"
+	v3 "github.com/rancher/types/apis/project.cattle.io/v3"
+	v1 "k8s.io/api/core/v1"
 )
 
 func secretTypes(schemas *types.Schemas) *types.Schemas {
@@ -125,7 +125,7 @@ func secretTypes(schemas *types.Schemas) *types.Schemas {
 					m.AnnotationField{Field: "algorithm", IgnoreDefinition: true},
 					m.AnnotationField{Field: "serialNumber", IgnoreDefinition: true},
 					m.AnnotationField{Field: "keySize", IgnoreDefinition: true},
-					m.AnnotationField{Field: "subjectAlternativeNames", IgnoreDefinition: true},
+					m.AnnotationField{Field: "subjectAlternativeNames", IgnoreDefinition: true, List: true},
 					m.SetValue{
 						Field:            "type",
 						Value:            "certificate",
@@ -206,7 +206,7 @@ func secretTypes(schemas *types.Schemas) *types.Schemas {
 				},
 			},
 		).
-		AddMapperForType(&Version, v3.RegistryCredential{}, RegistryCredentialMapper{}).
+		AddMapperForType(&Version, v1.Secret{}, RegistryCredentialMapper{}).
 		MustImportAndCustomize(&Version, v1.Secret{}, func(schema *types.Schema) {
 			schema.MustCustomizeField("kind", func(f types.Field) types.Field {
 				f.Options = []string{

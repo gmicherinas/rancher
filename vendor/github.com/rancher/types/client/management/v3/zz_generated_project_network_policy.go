@@ -14,13 +14,13 @@ const (
 	ProjectNetworkPolicyFieldName                 = "name"
 	ProjectNetworkPolicyFieldNamespaceId          = "namespaceId"
 	ProjectNetworkPolicyFieldOwnerReferences      = "ownerReferences"
-	ProjectNetworkPolicyFieldProjectId            = "projectId"
+	ProjectNetworkPolicyFieldProjectID            = "projectId"
 	ProjectNetworkPolicyFieldRemoved              = "removed"
 	ProjectNetworkPolicyFieldState                = "state"
 	ProjectNetworkPolicyFieldStatus               = "status"
 	ProjectNetworkPolicyFieldTransitioning        = "transitioning"
 	ProjectNetworkPolicyFieldTransitioningMessage = "transitioningMessage"
-	ProjectNetworkPolicyFieldUuid                 = "uuid"
+	ProjectNetworkPolicyFieldUUID                 = "uuid"
 )
 
 type ProjectNetworkPolicy struct {
@@ -33,14 +33,15 @@ type ProjectNetworkPolicy struct {
 	Name                 string                      `json:"name,omitempty" yaml:"name,omitempty"`
 	NamespaceId          string                      `json:"namespaceId,omitempty" yaml:"namespaceId,omitempty"`
 	OwnerReferences      []OwnerReference            `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
-	ProjectId            string                      `json:"projectId,omitempty" yaml:"projectId,omitempty"`
+	ProjectID            string                      `json:"projectId,omitempty" yaml:"projectId,omitempty"`
 	Removed              string                      `json:"removed,omitempty" yaml:"removed,omitempty"`
 	State                string                      `json:"state,omitempty" yaml:"state,omitempty"`
 	Status               *ProjectNetworkPolicyStatus `json:"status,omitempty" yaml:"status,omitempty"`
 	Transitioning        string                      `json:"transitioning,omitempty" yaml:"transitioning,omitempty"`
 	TransitioningMessage string                      `json:"transitioningMessage,omitempty" yaml:"transitioningMessage,omitempty"`
-	Uuid                 string                      `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                 string                      `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type ProjectNetworkPolicyCollection struct {
 	types.Collection
 	Data   []ProjectNetworkPolicy `json:"data,omitempty"`
@@ -53,8 +54,10 @@ type ProjectNetworkPolicyClient struct {
 
 type ProjectNetworkPolicyOperations interface {
 	List(opts *types.ListOpts) (*ProjectNetworkPolicyCollection, error)
+	ListAll(opts *types.ListOpts) (*ProjectNetworkPolicyCollection, error)
 	Create(opts *ProjectNetworkPolicy) (*ProjectNetworkPolicy, error)
 	Update(existing *ProjectNetworkPolicy, updates interface{}) (*ProjectNetworkPolicy, error)
+	Replace(existing *ProjectNetworkPolicy) (*ProjectNetworkPolicy, error)
 	ByID(id string) (*ProjectNetworkPolicy, error)
 	Delete(container *ProjectNetworkPolicy) error
 }
@@ -77,10 +80,34 @@ func (c *ProjectNetworkPolicyClient) Update(existing *ProjectNetworkPolicy, upda
 	return resp, err
 }
 
+func (c *ProjectNetworkPolicyClient) Replace(obj *ProjectNetworkPolicy) (*ProjectNetworkPolicy, error) {
+	resp := &ProjectNetworkPolicy{}
+	err := c.apiClient.Ops.DoReplace(ProjectNetworkPolicyType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *ProjectNetworkPolicyClient) List(opts *types.ListOpts) (*ProjectNetworkPolicyCollection, error) {
 	resp := &ProjectNetworkPolicyCollection{}
 	err := c.apiClient.Ops.DoList(ProjectNetworkPolicyType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *ProjectNetworkPolicyClient) ListAll(opts *types.ListOpts) (*ProjectNetworkPolicyCollection, error) {
+	resp := &ProjectNetworkPolicyCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

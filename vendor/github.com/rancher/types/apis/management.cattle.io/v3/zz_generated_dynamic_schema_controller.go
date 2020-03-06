@@ -2,14 +2,17 @@ package v3
 
 import (
 	"context"
+	"time"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
@@ -26,15 +29,34 @@ var (
 		Namespaced:   false,
 		Kind:         DynamicSchemaGroupVersionKind.Kind,
 	}
+
+	DynamicSchemaGroupVersionResource = schema.GroupVersionResource{
+		Group:    GroupName,
+		Version:  Version,
+		Resource: "dynamicschemas",
+	}
 )
+
+func init() {
+	resource.Put(DynamicSchemaGroupVersionResource)
+}
+
+func NewDynamicSchema(namespace, name string, obj DynamicSchema) *DynamicSchema {
+	obj.APIVersion, obj.Kind = DynamicSchemaGroupVersionKind.ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
 
 type DynamicSchemaList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []DynamicSchema
+	Items           []DynamicSchema `json:"items"`
 }
 
-type DynamicSchemaHandlerFunc func(key string, obj *DynamicSchema) error
+type DynamicSchemaHandlerFunc func(key string, obj *DynamicSchema) (runtime.Object, error)
+
+type DynamicSchemaChangeHandlerFunc func(obj *DynamicSchema) (runtime.Object, error)
 
 type DynamicSchemaLister interface {
 	List(namespace string, selector labels.Selector) (ret []*DynamicSchema, err error)
@@ -42,17 +64,21 @@ type DynamicSchemaLister interface {
 }
 
 type DynamicSchemaController interface {
+	Generic() controller.GenericController
 	Informer() cache.SharedIndexInformer
 	Lister() DynamicSchemaLister
-	AddHandler(name string, handler DynamicSchemaHandlerFunc)
-	AddClusterScopedHandler(name, clusterName string, handler DynamicSchemaHandlerFunc)
+	AddHandler(ctx context.Context, name string, handler DynamicSchemaHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync DynamicSchemaHandlerFunc)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, handler DynamicSchemaHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, handler DynamicSchemaHandlerFunc)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, after time.Duration)
 	Sync(ctx context.Context) error
 	Start(ctx context.Context, threadiness int) error
 }
 
 type DynamicSchemaInterface interface {
-	ObjectClient() *clientbase.ObjectClient
+	ObjectClient() *objectclient.ObjectClient
 	Create(*DynamicSchema) (*DynamicSchema, error)
 	GetNamespaced(namespace, name string, opts metav1.GetOptions) (*DynamicSchema, error)
 	Get(name string, opts metav1.GetOptions) (*DynamicSchema, error)
@@ -60,13 +86,18 @@ type DynamicSchemaInterface interface {
 	Delete(name string, options *metav1.DeleteOptions) error
 	DeleteNamespaced(namespace, name string, options *metav1.DeleteOptions) error
 	List(opts metav1.ListOptions) (*DynamicSchemaList, error)
+	ListNamespaced(namespace string, opts metav1.ListOptions) (*DynamicSchemaList, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts metav1.ListOptions) error
 	Controller() DynamicSchemaController
-	AddHandler(name string, sync DynamicSchemaHandlerFunc)
-	AddLifecycle(name string, lifecycle DynamicSchemaLifecycle)
-	AddClusterScopedHandler(name, clusterName string, sync DynamicSchemaHandlerFunc)
-	AddClusterScopedLifecycle(name, clusterName string, lifecycle DynamicSchemaLifecycle)
+	AddHandler(ctx context.Context, name string, sync DynamicSchemaHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync DynamicSchemaHandlerFunc)
+	AddLifecycle(ctx context.Context, name string, lifecycle DynamicSchemaLifecycle)
+	AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle DynamicSchemaLifecycle)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync DynamicSchemaHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync DynamicSchemaHandlerFunc)
+	AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle DynamicSchemaLifecycle)
+	AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle DynamicSchemaLifecycle)
 }
 
 type dynamicSchemaLister struct {
@@ -95,7 +126,7 @@ func (l *dynamicSchemaLister) Get(namespace, name string) (*DynamicSchema, error
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    DynamicSchemaGroupVersionKind.Group,
 			Resource: "dynamicSchema",
-		}, name)
+		}, key)
 	}
 	return obj.(*DynamicSchema), nil
 }
@@ -104,40 +135,65 @@ type dynamicSchemaController struct {
 	controller.GenericController
 }
 
+func (c *dynamicSchemaController) Generic() controller.GenericController {
+	return c.GenericController
+}
+
 func (c *dynamicSchemaController) Lister() DynamicSchemaLister {
 	return &dynamicSchemaLister{
 		controller: c,
 	}
 }
 
-func (c *dynamicSchemaController) AddHandler(name string, handler DynamicSchemaHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *dynamicSchemaController) AddHandler(ctx context.Context, name string, handler DynamicSchemaHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*DynamicSchema); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
-		return handler(key, obj.(*DynamicSchema))
 	})
 }
 
-func (c *dynamicSchemaController) AddClusterScopedHandler(name, cluster string, handler DynamicSchemaHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *dynamicSchemaController) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, handler DynamicSchemaHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*DynamicSchema); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		if !controller.ObjectInCluster(cluster, obj) {
-			return nil
+func (c *dynamicSchemaController) AddClusterScopedHandler(ctx context.Context, name, cluster string, handler DynamicSchemaHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*DynamicSchema); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		return handler(key, obj.(*DynamicSchema))
+func (c *dynamicSchemaController) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, cluster string, handler DynamicSchemaHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*DynamicSchema); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
+		}
 	})
 }
 
@@ -177,11 +233,11 @@ func (s *dynamicSchemaClient) Controller() DynamicSchemaController {
 type dynamicSchemaClient struct {
 	client       *Client
 	ns           string
-	objectClient *clientbase.ObjectClient
+	objectClient *objectclient.ObjectClient
 	controller   DynamicSchemaController
 }
 
-func (s *dynamicSchemaClient) ObjectClient() *clientbase.ObjectClient {
+func (s *dynamicSchemaClient) ObjectClient() *objectclient.ObjectClient {
 	return s.objectClient
 }
 
@@ -218,13 +274,18 @@ func (s *dynamicSchemaClient) List(opts metav1.ListOptions) (*DynamicSchemaList,
 	return obj.(*DynamicSchemaList), err
 }
 
+func (s *dynamicSchemaClient) ListNamespaced(namespace string, opts metav1.ListOptions) (*DynamicSchemaList, error) {
+	obj, err := s.objectClient.ListNamespaced(namespace, opts)
+	return obj.(*DynamicSchemaList), err
+}
+
 func (s *dynamicSchemaClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	return s.objectClient.Watch(opts)
 }
 
 // Patch applies the patch and returns the patched deployment.
-func (s *dynamicSchemaClient) Patch(o *DynamicSchema, data []byte, subresources ...string) (*DynamicSchema, error) {
-	obj, err := s.objectClient.Patch(o.Name, o, data, subresources...)
+func (s *dynamicSchemaClient) Patch(o *DynamicSchema, patchType types.PatchType, data []byte, subresources ...string) (*DynamicSchema, error) {
+	obj, err := s.objectClient.Patch(o.Name, o, patchType, data, subresources...)
 	return obj.(*DynamicSchema), err
 }
 
@@ -232,20 +293,38 @@ func (s *dynamicSchemaClient) DeleteCollection(deleteOpts *metav1.DeleteOptions,
 	return s.objectClient.DeleteCollection(deleteOpts, listOpts)
 }
 
-func (s *dynamicSchemaClient) AddHandler(name string, sync DynamicSchemaHandlerFunc) {
-	s.Controller().AddHandler(name, sync)
+func (s *dynamicSchemaClient) AddHandler(ctx context.Context, name string, sync DynamicSchemaHandlerFunc) {
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *dynamicSchemaClient) AddLifecycle(name string, lifecycle DynamicSchemaLifecycle) {
+func (s *dynamicSchemaClient) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync DynamicSchemaHandlerFunc) {
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
+}
+
+func (s *dynamicSchemaClient) AddLifecycle(ctx context.Context, name string, lifecycle DynamicSchemaLifecycle) {
 	sync := NewDynamicSchemaLifecycleAdapter(name, false, s, lifecycle)
-	s.AddHandler(name, sync)
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *dynamicSchemaClient) AddClusterScopedHandler(name, clusterName string, sync DynamicSchemaHandlerFunc) {
-	s.Controller().AddClusterScopedHandler(name, clusterName, sync)
+func (s *dynamicSchemaClient) AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle DynamicSchemaLifecycle) {
+	sync := NewDynamicSchemaLifecycleAdapter(name, false, s, lifecycle)
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
 }
 
-func (s *dynamicSchemaClient) AddClusterScopedLifecycle(name, clusterName string, lifecycle DynamicSchemaLifecycle) {
+func (s *dynamicSchemaClient) AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync DynamicSchemaHandlerFunc) {
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *dynamicSchemaClient) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync DynamicSchemaHandlerFunc) {
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
+}
+
+func (s *dynamicSchemaClient) AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle DynamicSchemaLifecycle) {
 	sync := NewDynamicSchemaLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
-	s.AddClusterScopedHandler(name, clusterName, sync)
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *dynamicSchemaClient) AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle DynamicSchemaLifecycle) {
+	sync := NewDynamicSchemaLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
 }

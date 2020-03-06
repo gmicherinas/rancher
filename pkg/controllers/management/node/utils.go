@@ -7,14 +7,17 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/norman/types/convert"
+	"github.com/rancher/rancher/pkg/jailer"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -30,8 +33,17 @@ var (
 const (
 	errorCreatingNode = "Error creating machine: "
 	nodeDirEnvKey     = "MACHINE_STORAGE_PATH="
-	nodeCmd           = "docker-machine"
+	nodeCmd           = "rancher-machine"
+	ec2TagFlag        = "tags"
 )
+
+func buildAgentCommand(node *v3.Node, dockerRun string) []string {
+	drun := strings.Fields(dockerRun)
+	cmd := []string{"--native-ssh", "ssh", node.Spec.RequestedHostname}
+	cmd = append(cmd, drun...)
+	cmd = append(cmd, "-r", "-n", node.Name)
+	return cmd
+}
 
 func buildCreateCommand(node *v3.Node, configMap map[string]interface{}) []string {
 	sDriver := strings.ToLower(node.Status.NodeTemplateSpec.Driver)
@@ -47,9 +59,13 @@ func buildCreateCommand(node *v3.Node, configMap map[string]interface{}) []strin
 
 	for k, v := range configMap {
 		dmField := "--" + sDriver + "-" + strings.ToLower(regExHyphen.ReplaceAllString(k, "${1}-${2}"))
+		if v == nil {
+			continue
+		}
+
 		switch v.(type) {
-		case int64:
-			cmd = append(cmd, dmField, strconv.FormatInt(v.(int64), 10))
+		case float64:
+			cmd = append(cmd, dmField, fmt.Sprintf("%v", v))
 		case string:
 			if v.(string) != "" {
 				cmd = append(cmd, dmField, v.(string))
@@ -90,11 +106,30 @@ func mapToSlice(m map[string]string) []string {
 	return ret
 }
 
-func buildCommand(nodeDir string, cmdArgs []string) *exec.Cmd {
+func buildCommand(nodeDir string, node *v3.Node, cmdArgs []string) (*exec.Cmd, error) {
+	// In dev_mode, don't need jail or reference to jail in command
+	if os.Getenv("CATTLE_DEV_MODE") != "" {
+		env := initEnviron(nodeDir)
+		command := exec.Command(nodeCmd, cmdArgs...)
+		command.Env = env
+		return command, nil
+	}
+
+	cred, err := jailer.GetUserCred()
+	if err != nil {
+		return nil, errors.WithMessage(err, "get user cred error")
+	}
+
 	command := exec.Command(nodeCmd, cmdArgs...)
-	env := initEnviron(nodeDir)
-	command.Env = env
-	return command
+	command.SysProcAttr = &syscall.SysProcAttr{}
+	command.SysProcAttr.Credential = cred
+	command.SysProcAttr.Chroot = path.Join(jailer.BaseJailPath, node.Namespace)
+	envvars := []string{
+		nodeDirEnvKey + nodeDir,
+		"PATH=/usr/bin:/var/lib/rancher/management-state/bin",
+	}
+	command.Env = jailer.WhitelistEnvvars(envvars)
+	return command, nil
 }
 
 func initEnviron(nodeDir string) []string {
@@ -138,24 +173,31 @@ func startReturnOutput(command *exec.Cmd) (io.ReadCloser, io.ReadCloser, error) 
 	return readerStdout, readerStderr, nil
 }
 
-func getSSHKey(nodeDir string, obj *v3.Node) (string, error) {
-	if err := waitUntilSSHKey(nodeDir, obj); err != nil {
+func getSSHKey(nodeDir, keyPath string, obj *v3.Node) (string, error) {
+	keyName := filepath.Base(keyPath)
+	if keyName == "" || keyName == "." || keyName == string(filepath.Separator) {
+		keyName = "id_rsa"
+	}
+	if err := waitUntilSSHKey(nodeDir, keyName, obj); err != nil {
 		return "", err
 	}
 
-	return getSSHPrivateKey(nodeDir, obj)
+	return getSSHPrivateKey(nodeDir, keyName, obj)
 }
 
 func (m *Lifecycle) reportStatus(stdoutReader io.Reader, stderrReader io.Reader, node *v3.Node) (*v3.Node, error) {
 	scanner := bufio.NewScanner(stdoutReader)
 	for scanner.Scan() {
 		msg := scanner.Text()
-		logrus.Infof("stdout: %s", msg)
+		if strings.Contains(msg, "To see how to connect") {
+			continue
+		}
+		logrus.Debugf("stdout: %s", msg)
 		_, err := filterDockerMessage(msg, node)
 		if err != nil {
 			return node, err
 		}
-		m.logger.Info(node, msg)
+		logrus.Infof("[node-controller-rancher-machine] %v", msg)
 		v3.NodeConditionProvisioned.Message(node, msg)
 		// ignore update errors
 		if newObj, err := m.nodeClient.Update(node); err == nil {
@@ -182,22 +224,26 @@ func filterDockerMessage(msg string, node *v3.Node) (string, error) {
 	return msg, nil
 }
 
-func nodeExists(nodeDir string, name string) (bool, error) {
-	command := buildCommand(nodeDir, []string{"ls", "-q"})
+func nodeExists(nodeDir string, node *v3.Node) (bool, error) {
+	command, err := buildCommand(nodeDir, node, []string{"ls", "-q"})
+	if err != nil {
+		return false, err
+	}
+
 	r, err := command.StdoutPipe()
 	if err != nil {
 		return false, err
 	}
 
-	err = command.Start()
-	if err != nil {
+	if err = command.Start(); err != nil {
 		return false, err
 	}
+	defer command.Wait()
 
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		foundName := scanner.Text()
-		if foundName == name {
+		if foundName == node.Spec.RequestedHostname {
 			return true, nil
 		}
 	}
@@ -205,8 +251,7 @@ func nodeExists(nodeDir string, name string) (bool, error) {
 		return false, err
 	}
 
-	err = command.Wait()
-	if err != nil {
+	if err := command.Wait(); err != nil {
 		return false, err
 	}
 
@@ -214,22 +259,32 @@ func nodeExists(nodeDir string, name string) (bool, error) {
 }
 
 func deleteNode(nodeDir string, node *v3.Node) error {
-	command := buildCommand(nodeDir, []string{"rm", "-f", node.Spec.RequestedHostname})
-	err := command.Start()
+	command, err := buildCommand(nodeDir, node, []string{"rm", "-f", node.Spec.RequestedHostname})
 	if err != nil {
 		return err
 	}
-
-	err = command.Wait()
+	stdoutReader, stderrReader, err := startReturnOutput(command)
 	if err != nil {
 		return err
 	}
+	defer stdoutReader.Close()
+	defer stderrReader.Close()
+	scanner := bufio.NewScanner(stdoutReader)
+	for scanner.Scan() {
+		msg := scanner.Text()
+		logrus.Infof("[node-controller-rancher-machine] %v", msg)
+	}
+	scanner = bufio.NewScanner(stderrReader)
+	for scanner.Scan() {
+		msg := scanner.Text()
+		logrus.Warnf("[node-controller-rancher-machine] %v", msg)
+	}
 
-	return nil
+	return command.Wait()
 }
 
-func getSSHPrivateKey(nodeDir string, node *v3.Node) (string, error) {
-	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, "id_rsa")
+func getSSHPrivateKey(nodeDir, keyName string, node *v3.Node) (string, error) {
+	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, keyName)
 	data, err := ioutil.ReadFile(keyPath)
 	if err != nil {
 		return "", nil
@@ -237,8 +292,8 @@ func getSSHPrivateKey(nodeDir string, node *v3.Node) (string, error) {
 	return string(data), nil
 }
 
-func waitUntilSSHKey(nodeDir string, node *v3.Node) error {
-	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, "id_rsa")
+func waitUntilSSHKey(nodeDir, keyName string, node *v3.Node) error {
+	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, keyName)
 	startTime := time.Now()
 	increments := 1
 	for {
@@ -252,5 +307,16 @@ func waitUntilSSHKey(nodeDir string, node *v3.Node) error {
 			continue
 		}
 		return nil
+	}
+}
+
+func setEc2ClusterIDTag(data interface{}, clusterID string) {
+	if m, ok := data.(map[string]interface{}); ok {
+		tagValue := fmt.Sprintf("kubernetes.io/cluster/%s,owned", clusterID)
+		if tags, ok := m[ec2TagFlag]; !ok || convert.ToString(tags) == "" {
+			m[ec2TagFlag] = tagValue
+		} else {
+			m[ec2TagFlag] = convert.ToString(tags) + "," + tagValue
+		}
 	}
 }

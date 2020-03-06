@@ -16,6 +16,7 @@ const (
 	IngressFieldNamespaceId          = "namespaceId"
 	IngressFieldOwnerReferences      = "ownerReferences"
 	IngressFieldProjectID            = "projectId"
+	IngressFieldPublicEndpoints      = "publicEndpoints"
 	IngressFieldRemoved              = "removed"
 	IngressFieldRules                = "rules"
 	IngressFieldState                = "state"
@@ -23,7 +24,7 @@ const (
 	IngressFieldTLS                  = "tls"
 	IngressFieldTransitioning        = "transitioning"
 	IngressFieldTransitioningMessage = "transitioningMessage"
-	IngressFieldUuid                 = "uuid"
+	IngressFieldUUID                 = "uuid"
 )
 
 type Ingress struct {
@@ -38,6 +39,7 @@ type Ingress struct {
 	NamespaceId          string            `json:"namespaceId,omitempty" yaml:"namespaceId,omitempty"`
 	OwnerReferences      []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	ProjectID            string            `json:"projectId,omitempty" yaml:"projectId,omitempty"`
+	PublicEndpoints      []PublicEndpoint  `json:"publicEndpoints,omitempty" yaml:"publicEndpoints,omitempty"`
 	Removed              string            `json:"removed,omitempty" yaml:"removed,omitempty"`
 	Rules                []IngressRule     `json:"rules,omitempty" yaml:"rules,omitempty"`
 	State                string            `json:"state,omitempty" yaml:"state,omitempty"`
@@ -45,8 +47,9 @@ type Ingress struct {
 	TLS                  []IngressTLS      `json:"tls,omitempty" yaml:"tls,omitempty"`
 	Transitioning        string            `json:"transitioning,omitempty" yaml:"transitioning,omitempty"`
 	TransitioningMessage string            `json:"transitioningMessage,omitempty" yaml:"transitioningMessage,omitempty"`
-	Uuid                 string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                 string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type IngressCollection struct {
 	types.Collection
 	Data   []Ingress `json:"data,omitempty"`
@@ -59,8 +62,10 @@ type IngressClient struct {
 
 type IngressOperations interface {
 	List(opts *types.ListOpts) (*IngressCollection, error)
+	ListAll(opts *types.ListOpts) (*IngressCollection, error)
 	Create(opts *Ingress) (*Ingress, error)
 	Update(existing *Ingress, updates interface{}) (*Ingress, error)
+	Replace(existing *Ingress) (*Ingress, error)
 	ByID(id string) (*Ingress, error)
 	Delete(container *Ingress) error
 }
@@ -83,10 +88,34 @@ func (c *IngressClient) Update(existing *Ingress, updates interface{}) (*Ingress
 	return resp, err
 }
 
+func (c *IngressClient) Replace(obj *Ingress) (*Ingress, error) {
+	resp := &Ingress{}
+	err := c.apiClient.Ops.DoReplace(IngressType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *IngressClient) List(opts *types.ListOpts) (*IngressCollection, error) {
 	resp := &IngressCollection{}
 	err := c.apiClient.Ops.DoList(IngressType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *IngressClient) ListAll(opts *types.ListOpts) (*IngressCollection, error) {
+	resp := &IngressCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

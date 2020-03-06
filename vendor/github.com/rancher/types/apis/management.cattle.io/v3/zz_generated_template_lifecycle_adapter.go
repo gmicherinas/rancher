@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type TemplateLifecycle interface {
-	Create(obj *Template) (*Template, error)
-	Remove(obj *Template) (*Template, error)
-	Updated(obj *Template) (*Template, error)
+	Create(obj *Template) (runtime.Object, error)
+	Remove(obj *Template) (runtime.Object, error)
+	Updated(obj *Template) (runtime.Object, error)
 }
 
 type templateLifecycleAdapter struct {
 	lifecycle TemplateLifecycle
+}
+
+func (w *templateLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *templateLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *templateLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *templateLifecycleAdapter) Updated(obj runtime.Object) (runtime.Object, 
 }
 
 func NewTemplateLifecycleAdapter(name string, clusterScoped bool, client TemplateInterface, l TemplateLifecycle) TemplateHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(TemplateGroupVersionResource)
+	}
 	adapter := &templateLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *Template) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *Template) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

@@ -9,6 +9,7 @@ var (
 	PermissionDenied = ErrorCode{"PermissionDenied", 403}
 	NotFound         = ErrorCode{"NotFound", 404}
 	MethodNotAllowed = ErrorCode{"MethodNotAllow", 405}
+	Conflict         = ErrorCode{"Conflict", 409}
 
 	InvalidDateFormat  = ErrorCode{"InvalidDateFormat", 422}
 	InvalidFormat      = ErrorCode{"InvalidFormat", 422}
@@ -34,40 +35,40 @@ var (
 )
 
 type ErrorCode struct {
-	code   string
+	Code   string
 	Status int
 }
 
 func (e ErrorCode) String() string {
-	return fmt.Sprintf("%s %d", e.code, e.Status)
+	return fmt.Sprintf("%s %d", e.Code, e.Status)
 }
 
 type APIError struct {
-	code      ErrorCode
-	message   string
+	Code      ErrorCode
+	Message   string
 	Cause     error
-	fieldName string
+	FieldName string
 }
 
 func NewAPIErrorLong(status int, code, message string) error {
 	return NewAPIError(ErrorCode{
-		code:   code,
+		Code:   code,
 		Status: status,
 	}, message)
 }
 
 func NewAPIError(code ErrorCode, message string) error {
 	return &APIError{
-		code:    code,
-		message: message,
+		Code:    code,
+		Message: message,
 	}
 }
 
 func NewFieldAPIError(code ErrorCode, fieldName, message string) error {
 	return &APIError{
-		code:      code,
-		message:   message,
-		fieldName: fieldName,
+		Code:      code,
+		Message:   message,
+		FieldName: fieldName,
 	}
 }
 
@@ -76,9 +77,9 @@ func NewFieldAPIError(code ErrorCode, fieldName, message string) error {
 func WrapFieldAPIError(err error, code ErrorCode, fieldName, message string) error {
 	return &APIError{
 		Cause:     err,
-		code:      code,
-		message:   message,
-		fieldName: fieldName,
+		Code:      code,
+		Message:   message,
+		FieldName: fieldName,
 	}
 }
 
@@ -86,20 +87,43 @@ func WrapFieldAPIError(err error, code ErrorCode, fieldName, message string) err
 // err WILL NOT be in the API response
 func WrapAPIError(err error, code ErrorCode, message string) error {
 	return &APIError{
-		code:    code,
-		message: message,
+		Code:    code,
+		Message: message,
 		Cause:   err,
 	}
 }
 
 func (a *APIError) Error() string {
-	if a.fieldName != "" {
-		return fmt.Sprintf("%s=%s: %s", a.fieldName, a.code, a.message)
+	if a.FieldName != "" {
+		return fmt.Sprintf("%s=%s: %s", a.FieldName, a.Code, a.Message)
 	}
-	return fmt.Sprintf("%s: %s", a.code, a.message)
+	return fmt.Sprintf("%s: %s", a.Code, a.Message)
 }
 
 func IsAPIError(err error) bool {
 	_, ok := err.(*APIError)
 	return ok
+}
+
+func IsNotFound(err error) bool {
+	if apiError, ok := err.(*APIError); ok {
+		return apiError.Code.Status == 404
+	}
+
+	return false
+}
+
+func IsConflict(err error) bool {
+	if apiError, ok := err.(*APIError); ok {
+		return apiError.Code.Status == 409
+	}
+
+	return false
+}
+
+func IsForbidden(err error) bool {
+	if apiError, ok := err.(*APIError); ok {
+		return apiError.Code.Status == 403
+	}
+	return false
 }

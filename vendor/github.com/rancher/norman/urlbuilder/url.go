@@ -3,23 +3,25 @@ package urlbuilder
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/rancher/norman/name"
 	"github.com/rancher/norman/types"
+	"github.com/rancher/wrangler/pkg/name"
 )
 
 const (
-	DefaultOverrideURLHeader = "X-API-request-url"
-	ForwardedHostHeader      = "X-Forwarded-Host"
-	ForwardedProtoHeader     = "X-Forwarded-Proto"
-	ForwardedPortHeader      = "X-Forwarded-Port"
+	PrefixHeader           = "X-API-URL-Prefix"
+	ForwardedAPIHostHeader = "X-API-Host"
+	ForwardedHostHeader    = "X-Forwarded-Host"
+	ForwardedProtoHeader   = "X-Forwarded-Proto"
+	ForwardedPortHeader    = "X-Forwarded-Port"
 )
 
 func New(r *http.Request, version types.APIVersion, schemas *types.Schemas) (types.URLBuilder, error) {
-	requestURL := parseRequestURL(r)
+	requestURL := ParseRequestURL(r)
 	responseURLBase, err := parseResponseURLBase(requestURL, r)
 	if err != nil {
 		return nil, err
@@ -34,6 +36,61 @@ func New(r *http.Request, version types.APIVersion, schemas *types.Schemas) (typ
 	}
 
 	return builder, nil
+}
+
+func ParseRequestURL(r *http.Request) string {
+	scheme := GetScheme(r)
+	host := GetHost(r, scheme)
+	return fmt.Sprintf("%s://%s%s%s", scheme, host, r.Header.Get(PrefixHeader), r.URL.Path)
+}
+
+func GetHost(r *http.Request, scheme string) string {
+	host := r.Header.Get(ForwardedAPIHostHeader)
+	if host != "" {
+		return host
+	}
+
+	host = strings.Split(r.Header.Get(ForwardedHostHeader), ",")[0]
+	if host == "" {
+		host = r.Host
+	}
+
+	port := r.Header.Get(ForwardedPortHeader)
+	if port == "" {
+		return host
+	}
+
+	if port == "80" && scheme == "http" {
+		return host
+	}
+
+	if port == "443" && scheme == "http" {
+		return host
+	}
+
+	hostname, _, err := net.SplitHostPort(host)
+	if err != nil {
+		hostname = host
+	}
+
+	return strings.Join([]string{hostname, port}, ":")
+}
+
+func GetScheme(r *http.Request) string {
+	scheme := r.Header.Get(ForwardedProtoHeader)
+	if scheme != "" {
+		switch scheme {
+		case "ws":
+			return "http"
+		case "wss":
+			return "https"
+		default:
+			return scheme
+		}
+	} else if r.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 type urlBuilder struct {
@@ -56,6 +113,10 @@ func (u *urlBuilder) SchemaLink(schema *types.Schema) string {
 func (u *urlBuilder) Link(linkName string, resource *types.RawResource) string {
 	if resource.ID == "" || linkName == "" {
 		return ""
+	}
+
+	if self, ok := resource.Links["self"]; ok {
+		return self + "/" + strings.ToLower(linkName)
 	}
 
 	return u.constructBasicURL(resource.Schema.Version, resource.Schema.PluralName, resource.ID, strings.ToLower(linkName))
@@ -139,7 +200,7 @@ func (u *urlBuilder) ResourceLinkByID(schema *types.Schema, id string) string {
 }
 
 func (u *urlBuilder) constructBasicURL(version types.APIVersion, parts ...string) string {
-	buffer := bytes.Buffer{}
+	buffer := strings.Builder{}
 
 	buffer.WriteString(u.responseURLBase)
 	if version.Path == "" {
@@ -165,81 +226,6 @@ func (u *urlBuilder) getPluralName(schema *types.Schema) string {
 		return strings.ToLower(name.GuessPluralName(schema.ID))
 	}
 	return strings.ToLower(schema.PluralName)
-}
-
-// Constructs the request URL based off of standard headers in the request, falling back to the HttpServletRequest.getRequestURL()
-// if the headers aren't available. Here is the ordered list of how we'll attempt to construct the URL:
-//  - x-api-request-url
-//  - x-forwarded-proto://x-forwarded-host:x-forwarded-port/HttpServletRequest.getRequestURI()
-//  - x-forwarded-proto://x-forwarded-host/HttpServletRequest.getRequestURI()
-//  - x-forwarded-proto://host:x-forwarded-port/HttpServletRequest.getRequestURI()
-//  - x-forwarded-proto://host/HttpServletRequest.getRequestURI() request.getRequestURL()
-//
-// Additional notes:
-//  - With x-api-request-url, the query string is passed, it will be dropped to match the other formats.
-//  - If the x-forwarded-host/host header has a port and x-forwarded-port has been passed, x-forwarded-port will be used.
-func parseRequestURL(r *http.Request) string {
-	// Get url from custom x-api-request-url header
-	requestURL := getOverrideHeader(r, DefaultOverrideURLHeader, "")
-	if requestURL != "" {
-		return strings.SplitN(requestURL, "?", 2)[0]
-	}
-
-	// Get url from standard headers
-	requestURL = getURLFromStandardHeaders(r)
-	if requestURL != "" {
-		return requestURL
-	}
-
-	// Use incoming url
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return fmt.Sprintf("%s://%s%s", scheme, r.Host, r.URL.Path)
-}
-
-func getURLFromStandardHeaders(r *http.Request) string {
-	xForwardedProto := getOverrideHeader(r, ForwardedProtoHeader, "")
-	if xForwardedProto == "" {
-		return ""
-	}
-
-	host := getOverrideHeader(r, ForwardedHostHeader, "")
-	if host == "" {
-		host = r.Host
-	}
-
-	if host == "" {
-		return ""
-	}
-
-	port := getOverrideHeader(r, ForwardedPortHeader, "")
-	if port == "443" || port == "80" {
-		port = "" // Don't include default ports in url
-	}
-
-	if port != "" && strings.Contains(host, ":") {
-		// Have to strip the port that is in the host. Handle IPv6, which has this format: [::1]:8080
-		if (strings.HasPrefix(host, "[") && strings.Contains(host, "]:")) || !strings.HasPrefix(host, "[") {
-			host = host[0:strings.LastIndex(host, ":")]
-		}
-	}
-
-	if port != "" {
-		port = ":" + port
-	}
-
-	return fmt.Sprintf("%s://%s%s%s", xForwardedProto, host, port, r.URL.Path)
-}
-
-func getOverrideHeader(r *http.Request, header string, defaultValue string) string {
-	// Need to handle comma separated hosts in X-Forwarded-For
-	value := r.Header.Get(header)
-	if value != "" {
-		return strings.TrimSpace(strings.Split(value, ",")[0])
-	}
-	return defaultValue
 }
 
 func parseResponseURLBase(requestURL string, r *http.Request) (string, error) {
@@ -270,4 +256,8 @@ func (u *urlBuilder) Action(action string, resource *types.RawResource) string {
 func (u *urlBuilder) CollectionAction(schema *types.Schema, versionOverride *types.APIVersion, action string) string {
 	collectionURL := u.Collection(schema, versionOverride)
 	return collectionURL + "?action=" + url.QueryEscape(action)
+}
+
+func (u *urlBuilder) ActionLinkByID(schema *types.Schema, id string, action string) string {
+	return u.constructBasicURL(schema.Version, schema.PluralName, id) + "?action=" + url.QueryEscape(action)
 }

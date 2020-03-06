@@ -9,13 +9,13 @@ const (
 	GroupMemberFieldAnnotations     = "annotations"
 	GroupMemberFieldCreated         = "created"
 	GroupMemberFieldCreatorID       = "creatorId"
-	GroupMemberFieldGroupId         = "groupId"
+	GroupMemberFieldGroupID         = "groupId"
 	GroupMemberFieldLabels          = "labels"
 	GroupMemberFieldName            = "name"
 	GroupMemberFieldOwnerReferences = "ownerReferences"
 	GroupMemberFieldPrincipalID     = "principalId"
 	GroupMemberFieldRemoved         = "removed"
-	GroupMemberFieldUuid            = "uuid"
+	GroupMemberFieldUUID            = "uuid"
 )
 
 type GroupMember struct {
@@ -23,14 +23,15 @@ type GroupMember struct {
 	Annotations     map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
 	Created         string            `json:"created,omitempty" yaml:"created,omitempty"`
 	CreatorID       string            `json:"creatorId,omitempty" yaml:"creatorId,omitempty"`
-	GroupId         string            `json:"groupId,omitempty" yaml:"groupId,omitempty"`
+	GroupID         string            `json:"groupId,omitempty" yaml:"groupId,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
 	Name            string            `json:"name,omitempty" yaml:"name,omitempty"`
 	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	PrincipalID     string            `json:"principalId,omitempty" yaml:"principalId,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type GroupMemberCollection struct {
 	types.Collection
 	Data   []GroupMember `json:"data,omitempty"`
@@ -43,8 +44,10 @@ type GroupMemberClient struct {
 
 type GroupMemberOperations interface {
 	List(opts *types.ListOpts) (*GroupMemberCollection, error)
+	ListAll(opts *types.ListOpts) (*GroupMemberCollection, error)
 	Create(opts *GroupMember) (*GroupMember, error)
 	Update(existing *GroupMember, updates interface{}) (*GroupMember, error)
+	Replace(existing *GroupMember) (*GroupMember, error)
 	ByID(id string) (*GroupMember, error)
 	Delete(container *GroupMember) error
 }
@@ -67,10 +70,34 @@ func (c *GroupMemberClient) Update(existing *GroupMember, updates interface{}) (
 	return resp, err
 }
 
+func (c *GroupMemberClient) Replace(obj *GroupMember) (*GroupMember, error) {
+	resp := &GroupMember{}
+	err := c.apiClient.Ops.DoReplace(GroupMemberType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *GroupMemberClient) List(opts *types.ListOpts) (*GroupMemberCollection, error) {
 	resp := &GroupMemberCollection{}
 	err := c.apiClient.Ops.DoList(GroupMemberType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *GroupMemberClient) ListAll(opts *types.ListOpts) (*GroupMemberCollection, error) {
+	resp := &GroupMemberCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

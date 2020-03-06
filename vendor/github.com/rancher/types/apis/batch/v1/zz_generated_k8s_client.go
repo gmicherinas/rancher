@@ -4,10 +4,16 @@ import (
 	"context"
 	"sync"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
-	"k8s.io/client-go/dynamic"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/objectclient/dynamic"
+	"github.com/rancher/norman/restwatch"
 	"k8s.io/client-go/rest"
+)
+
+type (
+	contextKeyType        struct{}
+	contextClientsKeyType struct{}
 )
 
 type Interface interface {
@@ -27,11 +33,10 @@ type Client struct {
 
 func NewForConfig(config rest.Config) (Interface, error) {
 	if config.NegotiatedSerializer == nil {
-		configConfig := dynamic.ContentConfig()
-		config.NegotiatedSerializer = configConfig.NegotiatedSerializer
+		config.NegotiatedSerializer = dynamic.NegotiatedSerializer
 	}
 
-	restClient, err := rest.UnversionedRESTClientFor(&config)
+	restClient, err := restwatch.UnversionedRESTClientFor(&config)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +65,7 @@ type JobsGetter interface {
 }
 
 func (c *Client) Jobs(namespace string) JobInterface {
-	objectClient := clientbase.NewObjectClient(namespace, c.restClient, &JobResource, JobGroupVersionKind, jobFactory{})
+	objectClient := objectclient.NewObjectClient(namespace, c.restClient, &JobResource, JobGroupVersionKind, jobFactory{})
 	return &jobClient{
 		ns:           namespace,
 		client:       c,

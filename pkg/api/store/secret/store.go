@@ -1,13 +1,17 @@
 package secret
 
 import (
+	"context"
 	"strings"
 
 	"github.com/rancher/norman/store/proxy"
 	"github.com/rancher/norman/store/transform"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
+	"github.com/rancher/rancher/pkg/api/store/cert"
+	client "github.com/rancher/types/client/project/v3"
 	"github.com/rancher/types/config"
+	"github.com/sirupsen/logrus"
 )
 
 type Store struct {
@@ -22,17 +26,18 @@ func (s *Store) Create(apiContext *types.APIContext, schema *types.Schema, data 
 	return s.Store.Create(apiContext, schema, data)
 }
 
-func NewNamespacedSecretStore(clientGetter proxy.ClientGetter) *Store {
+func NewNamespacedSecretStore(ctx context.Context, clientGetter proxy.ClientGetter) *Store {
+	secretsStore := proxy.NewProxyStore(ctx, clientGetter,
+		config.UserStorageContext,
+		[]string{"api"},
+		"",
+		"v1",
+		"Secret",
+		"secrets")
 	return &Store{
 		Store: &transform.Store{
-			Store: proxy.NewProxyStore(clientGetter,
-				config.UserStorageContext,
-				[]string{"api"},
-				"",
-				"v1",
-				"Secret",
-				"secrets"),
-			Transformer: func(apiContext *types.APIContext, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
+			Store: secretsStore,
+			Transformer: func(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
 				if data == nil {
 					return data, nil
 				}
@@ -54,6 +59,13 @@ func NewNamespacedSecretStore(clientGetter proxy.ClientGetter) *Store {
 				parts := strings.Split(convert.ToString(data["type"]), "/")
 				parts[len(parts)-1] = "namespaced" + convert.Capitalize(parts[len(parts)-1])
 				data["type"] = strings.Join(parts, "/")
+				if data["type"] != client.NamespacedCertificateType {
+					return data, nil
+				}
+				if err := cert.AddCertInfo(data); err != nil {
+					logrus.Errorf("Error %v parsing cert %v. Will not display correctly in UI", err, data["name"])
+					return data, nil
+				}
 				return data, nil
 			},
 		},

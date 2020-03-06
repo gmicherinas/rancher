@@ -17,7 +17,7 @@ const (
 	AuthConfigFieldOwnerReferences     = "ownerReferences"
 	AuthConfigFieldRemoved             = "removed"
 	AuthConfigFieldType                = "type"
-	AuthConfigFieldUuid                = "uuid"
+	AuthConfigFieldUUID                = "uuid"
 )
 
 type AuthConfig struct {
@@ -33,8 +33,9 @@ type AuthConfig struct {
 	OwnerReferences     []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	Removed             string            `json:"removed,omitempty" yaml:"removed,omitempty"`
 	Type                string            `json:"type,omitempty" yaml:"type,omitempty"`
-	Uuid                string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type AuthConfigCollection struct {
 	types.Collection
 	Data   []AuthConfig `json:"data,omitempty"`
@@ -47,8 +48,10 @@ type AuthConfigClient struct {
 
 type AuthConfigOperations interface {
 	List(opts *types.ListOpts) (*AuthConfigCollection, error)
+	ListAll(opts *types.ListOpts) (*AuthConfigCollection, error)
 	Create(opts *AuthConfig) (*AuthConfig, error)
 	Update(existing *AuthConfig, updates interface{}) (*AuthConfig, error)
+	Replace(existing *AuthConfig) (*AuthConfig, error)
 	ByID(id string) (*AuthConfig, error)
 	Delete(container *AuthConfig) error
 }
@@ -71,10 +74,34 @@ func (c *AuthConfigClient) Update(existing *AuthConfig, updates interface{}) (*A
 	return resp, err
 }
 
+func (c *AuthConfigClient) Replace(obj *AuthConfig) (*AuthConfig, error) {
+	resp := &AuthConfig{}
+	err := c.apiClient.Ops.DoReplace(AuthConfigType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *AuthConfigClient) List(opts *types.ListOpts) (*AuthConfigCollection, error) {
 	resp := &AuthConfigCollection{}
 	err := c.apiClient.Ops.DoList(AuthConfigType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *AuthConfigClient) ListAll(opts *types.ListOpts) (*AuthConfigCollection, error) {
+	resp := &AuthConfigCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

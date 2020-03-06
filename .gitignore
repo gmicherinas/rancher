@@ -4,12 +4,17 @@
 /build
 *.swp
 /.trash-cache
+/trash.lock
 /.idea
 /package/rancher
 /package/agent
 /tests/MANIFEST
+/tests/integration/MANIFEST
+tests/integration/MANIFEST
+tests/integration/.idea/
 /tests/.cache
 /tests/.tox
+/tests/integration/.tox/
 /tests/.venv
 /tests/.idea
 /default.etcd
@@ -17,3 +22,9 @@
 __pycache__
 /management-state
 /rancher
+*.pytest_cache
+.kube/
+.DS_Store
+tests/validation/.idea
+all.yaml
+kustomization.yaml

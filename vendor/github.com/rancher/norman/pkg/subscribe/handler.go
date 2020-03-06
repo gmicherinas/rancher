@@ -85,7 +85,10 @@ func handler(apiContext *types.APIContext) error {
 		close(events)
 	}()
 
-	jsonWriter := writer.JSONResponseWriter{}
+	jsonWriter := writer.EncodingResponseWriter{
+		ContentType: "application/json",
+		Encoder:     types.JSONEncoder,
+	}
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 
@@ -106,16 +109,17 @@ func handler(apiContext *types.APIContext) error {
 			if schema != nil {
 				buffer := &bytes.Buffer{}
 				if err := jsonWriter.VersionBody(apiContext, &schema.Version, buffer, item); err != nil {
-					return err
+					cancel()
+					continue
 				}
 
 				if err := writeData(c, header, buffer.Bytes()); err != nil {
-					return err
+					cancel()
 				}
 			}
 		case <-t.C:
 			if err := writeData(c, `{"name":"ping","data":`, []byte("{}")); err != nil {
-				return err
+				cancel()
 			}
 		}
 	}

@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type NamespacedSSHAuthLifecycle interface {
-	Create(obj *NamespacedSSHAuth) (*NamespacedSSHAuth, error)
-	Remove(obj *NamespacedSSHAuth) (*NamespacedSSHAuth, error)
-	Updated(obj *NamespacedSSHAuth) (*NamespacedSSHAuth, error)
+	Create(obj *NamespacedSSHAuth) (runtime.Object, error)
+	Remove(obj *NamespacedSSHAuth) (runtime.Object, error)
+	Updated(obj *NamespacedSSHAuth) (runtime.Object, error)
 }
 
 type namespacedSshAuthLifecycleAdapter struct {
 	lifecycle NamespacedSSHAuthLifecycle
+}
+
+func (w *namespacedSshAuthLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *namespacedSshAuthLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *namespacedSshAuthLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *namespacedSshAuthLifecycleAdapter) Updated(obj runtime.Object) (runtime
 }
 
 func NewNamespacedSSHAuthLifecycleAdapter(name string, clusterScoped bool, client NamespacedSSHAuthInterface, l NamespacedSSHAuthLifecycle) NamespacedSSHAuthHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(NamespacedSSHAuthGroupVersionResource)
+	}
 	adapter := &namespacedSshAuthLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *NamespacedSSHAuth) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *NamespacedSSHAuth) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

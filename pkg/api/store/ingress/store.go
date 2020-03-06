@@ -6,13 +6,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/rancher/norman/store/transform"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
 	"github.com/rancher/norman/types/values"
+	"github.com/rancher/rancher/pkg/api/store/workload"
+	"github.com/rancher/rancher/pkg/controllers/user/ingress"
+	"github.com/rancher/rancher/pkg/ref"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	ingressStateAnnotation = "field.cattle.io/ingressState"
 )
 
 func Wrap(store types.Store) types.Store {
@@ -27,57 +35,93 @@ type Store struct {
 }
 
 func (p *Store) Create(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}) (map[string]interface{}, error) {
-	formatData(data, false)
+	name, _ := data["name"].(string)
+	namespace, _ := data["namespaceId"].(string)
+	id := ref.FromStrings(namespace, name)
+	formatData(id, data, false)
 	data, err := p.Store.Create(apiContext, schema, data)
 	return data, err
 }
 
 func (p *Store) Update(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, id string) (map[string]interface{}, error) {
-	formatData(data, false)
+	formatData(id, data, false)
 	data, err := p.Store.Update(apiContext, schema, data, id)
 	return data, err
 }
 
-func formatData(data map[string]interface{}, forFrontend bool) {
+func formatData(id string, data map[string]interface{}, forFrontend bool) {
 	oldState := getState(data)
 	newState := map[string]string{}
 
 	// transform default backend
-	if target, ok := values.GetValue(data, "defaultBackend"); ok {
-		updateRule(convert.ToMapInterface(target), "/", forFrontend, data, oldState, newState)
+	if target, ok := values.GetValue(data, "defaultBackend"); ok && target != nil {
+		updateRule(convert.ToMapInterface(target), id, "", "/", forFrontend, data, oldState, newState)
 	}
 
 	// transform rules
-	if paths, ok := getPaths(data); ok {
+	if paths, ok, flag := getPaths(data); ok {
 		for hostpath, target := range paths {
-			updateRule(target, hostpath, forFrontend, data, oldState, newState)
+			updateRule(target, id, hostpath.host, hostpath.path, forFrontend, data, oldState, newState)
+		}
+		if flag {
+			updateDataRules(data)
 		}
 	}
 
 	updateCerts(data, forFrontend, oldState, newState)
 	setState(data, newState)
-
+	workload.SetPublicEndpointsFields(data)
 }
 
-func updateRule(target map[string]interface{}, hostpath string, forFrontend bool, data map[string]interface{}, oldState map[string]string, newState map[string]string) {
+func updateDataRules(data map[string]interface{}) {
+	v, ok := values.GetValue(data, "rules")
+	if !ok {
+		return
+	}
+	var updated []interface{}
+	rules := convert.ToInterfaceSlice(v)
+	for _, rule := range rules {
+		converted := convert.ToMapInterface(rule)
+		paths, ok := converted["paths"]
+		if ok {
+			pathSlice := convert.ToInterfaceSlice(paths)
+			for index, target := range pathSlice {
+				targetMap := convert.ToMapInterface(target)
+				serviceID := convert.ToString(values.GetValueN(targetMap, "serviceId"))
+				if serviceID == "" {
+					pathSlice = append(pathSlice[:index], pathSlice[index+1:]...)
+				}
+			}
+			converted["paths"] = pathSlice
+			if len(pathSlice) != 0 {
+				updated = append(updated, rule)
+			}
+		}
+	}
+	values.PutValue(data, updated, "rules")
+}
+
+func updateRule(target map[string]interface{}, id, host, path string, forFrontend bool, data map[string]interface{}, oldState map[string]string, newState map[string]string) {
 	targetData := convert.ToMapInterface(target)
 	port, _ := targetData["targetPort"]
 	serviceID, _ := targetData["serviceId"].(string)
-	stateKey := getStateKey(hostpath, convert.ToString(port))
+	namespace, name := ref.Parse(id)
+	stateKey := ingress.GetStateKey(name, namespace, host, path, convert.ToString(port))
 	if forFrontend {
 		isService := true
-		if serviceValue, ok := oldState[stateKey]; ok && !convert.IsEmpty(serviceValue) {
+		if serviceValue, ok := oldState[stateKey]; ok && !convert.IsAPIObjectEmpty(serviceValue) {
 			targetData["workloadIds"] = strings.Split(serviceValue, "/")
 			isService = false
 		}
 
 		if isService {
-			targetData["serviceId"] = fmt.Sprintf("%s/%s", data["namespaceId"].(string), serviceID)
+			targetData["serviceId"] = fmt.Sprintf("%s:%s", data["namespaceId"].(string), serviceID)
 		} else {
 			delete(targetData, "serviceId")
 		}
 	} else {
 		workloadIDs := convert.ToStringSlice(targetData["workloadIds"])
+		sort.Strings(workloadIDs)
 		if serviceID != "" {
 			splitted := strings.Split(serviceID, ":")
 			if len(splitted) > 1 {
@@ -88,6 +132,7 @@ func updateRule(target map[string]interface{}, hostpath string, forFrontend bool
 		}
 		newState[stateKey] = strings.Join(workloadIDs, "/")
 		targetData["serviceId"] = serviceID
+		values.RemoveValue(targetData, "workloadIds")
 	}
 }
 
@@ -103,33 +148,43 @@ func getServiceID(stateKey string) string {
 	return hex
 }
 
-func getStateKey(hostpath string, port string) string {
-	key := fmt.Sprintf("%s/%s", hostpath, port)
-	return base64.URLEncoding.EncodeToString([]byte(key))
-}
-
 func getCertKey(key string) string {
 	return base64.URLEncoding.EncodeToString([]byte(key))
 }
 
-func getPaths(data map[string]interface{}) (map[string]map[string]interface{}, bool) {
+type hostPath struct {
+	host string
+	path string
+}
+
+func getPaths(data map[string]interface{}) (map[hostPath]map[string]interface{}, bool, bool) {
 	v, ok := values.GetValue(data, "rules")
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
-
-	result := make(map[string]map[string]interface{})
+	flag := false
+	result := make(map[hostPath]map[string]interface{})
 	for _, rule := range convert.ToMapSlice(v) {
 		converted := convert.ToMapInterface(rule)
 		paths, ok := converted["paths"]
 		if ok {
-			for path, target := range convert.ToMapInterface(paths) {
-				result[fmt.Sprintf("%s/%s", convert.ToString(converted["host"]), path)] = convert.ToMapInterface(target)
+			for _, target := range convert.ToMapSlice(paths) {
+				targetMap := convert.ToMapInterface(target)
+				path := convert.ToString(targetMap["path"])
+				key := hostPath{host: convert.ToString(converted["host"]), path: path}
+				if existing, ok := result[key]; ok {
+					flag = true
+					targetWorkloadIds := convert.ToStringSlice(values.GetValueN(targetMap, "workloadIds"))
+					updated := convert.ToStringSlice(values.GetValueN(convert.ToMapInterface(existing), "workloadIds"))
+					targetWorkloadIds = append(targetWorkloadIds, updated...)
+					values.PutValue(targetMap, targetWorkloadIds, "workloadIds")
+				}
+				result[key] = targetMap
 			}
 		}
 	}
 
-	return result, true
+	return result, true, flag
 }
 
 func setState(data map[string]interface{}, stateMap map[string]string) {
@@ -139,13 +194,13 @@ func setState(data map[string]interface{}, stateMap map[string]string) {
 		return
 	}
 
-	values.PutValue(data, string(content), "annotations", "ingress.cattle.io/state")
+	values.PutValue(data, string(content), "annotations", ingressStateAnnotation)
 }
 
 func getState(data map[string]interface{}) map[string]string {
 	state := map[string]string{}
 
-	v, ok := values.GetValue(data, "annotations", "ingress.cattle.io/state")
+	v, ok := values.GetValue(data, "annotations", ingressStateAnnotation)
 	if ok {
 		json.Unmarshal([]byte(convert.ToString(v)), &state)
 	}
@@ -159,7 +214,12 @@ func updateCerts(data map[string]interface{}, forFrontend bool, oldState map[str
 			for _, cert := range certs {
 				certName := convert.ToString(cert["certificateId"])
 				certKey := getCertKey(certName)
-				cert["certificateId"] = oldState[certKey]
+				id := oldState[certKey]
+				if id == "" {
+					cert["certificateId"] = fmt.Sprintf("%s:%s", convert.ToString(data["namespaceId"]), certName)
+				} else {
+					cert["certificateId"] = id
+				}
 			}
 		}
 	} else {
@@ -181,9 +241,18 @@ func updateCerts(data map[string]interface{}, forFrontend bool, oldState map[str
 func New(store types.Store) types.Store {
 	return &transform.Store{
 		Store: store,
-		Transformer: func(apiContext *types.APIContext, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
-			formatData(data, true)
+		Transformer: func(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
+			id, _ := data["id"].(string)
+			formatData(id, data, true)
+			setIngressState(data)
 			return data, nil
 		},
+	}
+}
+
+func setIngressState(data map[string]interface{}) {
+	lbStatus, ok := values.GetSlice(data, "status", "loadBalancer", "ingress")
+	if !ok || len(lbStatus) == 0 {
+		data["state"] = "initializing"
 	}
 }

@@ -2,38 +2,64 @@ package authn
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/parse"
 	"github.com/rancher/norman/types"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/client/management/v3"
+	"github.com/rancher/rancher/pkg/auth/providerrefresh"
+	"github.com/rancher/rancher/pkg/settings"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
+	client "github.com/rancher/types/client/management/v3"
 	"golang.org/x/crypto/bcrypt"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func UserFormatter(apiContext *types.APIContext, resource *types.RawResource) {
+func (h *Handler) UserFormatter(apiContext *types.APIContext, resource *types.RawResource) {
 	resource.AddAction(apiContext, "setpassword")
+	if canRefresh := h.userCanRefresh(apiContext); canRefresh {
+		resource.AddAction(apiContext, "refreshauthprovideraccess")
+	}
 }
 
-func CollectionFormatter(apiContext *types.APIContext, collection *types.GenericCollection) {
+func (h *Handler) CollectionFormatter(apiContext *types.APIContext, collection *types.GenericCollection) {
 	collection.AddAction(apiContext, "changepassword")
+	if canRefresh := h.userCanRefresh(apiContext); canRefresh {
+		collection.AddAction(apiContext, "refreshauthprovideraccess")
+	}
 }
 
 type Handler struct {
-	UserClient v3.UserInterface
+	UserClient               v3.UserInterface
+	GlobalRoleBindingsClient v3.GlobalRoleBindingInterface
+	UserAuthRefresher        providerrefresh.UserAuthRefresher
 }
 
 func (h *Handler) Actions(actionName string, action *types.Action, apiContext *types.APIContext) error {
 	switch actionName {
 	case "changepassword":
-		return h.changePassword(actionName, action, apiContext)
+		if err := h.changePassword(actionName, action, apiContext); err != nil {
+			return err
+		}
 	case "setpassword":
-		return h.setPassword(actionName, action, apiContext)
+		if err := h.setPassword(actionName, action, apiContext); err != nil {
+			return err
+		}
+	case "refreshauthprovideraccess":
+		if err := h.refreshAttributes(actionName, action, apiContext); err != nil {
+			return err
+		}
+	default:
+		return errors.Errorf("bad action %v", actionName)
 	}
 
-	return errors.Errorf("bad action %v", actionName)
+	if !strings.EqualFold(settings.FirstLogin.Get(), "false") {
+		if err := settings.FirstLogin.Set("false"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (h *Handler) changePassword(actionName string, action *types.Action, request *types.APIContext) error {
@@ -71,7 +97,7 @@ func (h *Handler) changePassword(actionName string, action *types.Action, reques
 		return httperror.NewAPIError(httperror.InvalidBodyContent, "invalid current password")
 	}
 
-	newPassHash, err := hashPasswordString(newPass)
+	newPassHash, err := HashPasswordString(newPass)
 	if err != nil {
 		return err
 	}
@@ -112,6 +138,7 @@ func (h *Handler) setPassword(actionName string, action *types.Action, request *
 		return err
 	}
 	userData[client.UserFieldMustChangePassword] = false
+	delete(userData, "me")
 
 	userData, err = store.Update(request, request.Schema, userData, request.ID)
 	if err != nil {
@@ -120,4 +147,25 @@ func (h *Handler) setPassword(actionName string, action *types.Action, request *
 
 	request.WriteResponse(http.StatusOK, userData)
 	return nil
+}
+
+func (h *Handler) refreshAttributes(actionName string, action *types.Action, request *types.APIContext) error {
+	canRefresh := h.userCanRefresh(request)
+
+	if !canRefresh {
+		return errors.New("Not Allowed")
+	}
+
+	if request.ID != "" {
+		h.UserAuthRefresher.TriggerUserRefresh(request.ID, true)
+	} else {
+		h.UserAuthRefresher.TriggerAllUserRefresh()
+	}
+
+	request.WriteResponse(http.StatusOK, nil)
+	return nil
+}
+
+func (h *Handler) userCanRefresh(request *types.APIContext) bool {
+	return request.AccessControl.CanDo(v3.UserGroupVersionKind.Group, v3.UserResource.Name, "create", request, nil, request.Schema) == nil
 }

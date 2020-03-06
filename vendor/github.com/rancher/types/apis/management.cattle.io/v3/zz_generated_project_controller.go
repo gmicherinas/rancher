@@ -2,14 +2,17 @@ package v3
 
 import (
 	"context"
+	"time"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
@@ -27,15 +30,34 @@ var (
 
 		Kind: ProjectGroupVersionKind.Kind,
 	}
+
+	ProjectGroupVersionResource = schema.GroupVersionResource{
+		Group:    GroupName,
+		Version:  Version,
+		Resource: "projects",
+	}
 )
+
+func init() {
+	resource.Put(ProjectGroupVersionResource)
+}
+
+func NewProject(namespace, name string, obj Project) *Project {
+	obj.APIVersion, obj.Kind = ProjectGroupVersionKind.ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
 
 type ProjectList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []Project
+	Items           []Project `json:"items"`
 }
 
-type ProjectHandlerFunc func(key string, obj *Project) error
+type ProjectHandlerFunc func(key string, obj *Project) (runtime.Object, error)
+
+type ProjectChangeHandlerFunc func(obj *Project) (runtime.Object, error)
 
 type ProjectLister interface {
 	List(namespace string, selector labels.Selector) (ret []*Project, err error)
@@ -43,17 +65,21 @@ type ProjectLister interface {
 }
 
 type ProjectController interface {
+	Generic() controller.GenericController
 	Informer() cache.SharedIndexInformer
 	Lister() ProjectLister
-	AddHandler(name string, handler ProjectHandlerFunc)
-	AddClusterScopedHandler(name, clusterName string, handler ProjectHandlerFunc)
+	AddHandler(ctx context.Context, name string, handler ProjectHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync ProjectHandlerFunc)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, handler ProjectHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, handler ProjectHandlerFunc)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, after time.Duration)
 	Sync(ctx context.Context) error
 	Start(ctx context.Context, threadiness int) error
 }
 
 type ProjectInterface interface {
-	ObjectClient() *clientbase.ObjectClient
+	ObjectClient() *objectclient.ObjectClient
 	Create(*Project) (*Project, error)
 	GetNamespaced(namespace, name string, opts metav1.GetOptions) (*Project, error)
 	Get(name string, opts metav1.GetOptions) (*Project, error)
@@ -61,13 +87,18 @@ type ProjectInterface interface {
 	Delete(name string, options *metav1.DeleteOptions) error
 	DeleteNamespaced(namespace, name string, options *metav1.DeleteOptions) error
 	List(opts metav1.ListOptions) (*ProjectList, error)
+	ListNamespaced(namespace string, opts metav1.ListOptions) (*ProjectList, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts metav1.ListOptions) error
 	Controller() ProjectController
-	AddHandler(name string, sync ProjectHandlerFunc)
-	AddLifecycle(name string, lifecycle ProjectLifecycle)
-	AddClusterScopedHandler(name, clusterName string, sync ProjectHandlerFunc)
-	AddClusterScopedLifecycle(name, clusterName string, lifecycle ProjectLifecycle)
+	AddHandler(ctx context.Context, name string, sync ProjectHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync ProjectHandlerFunc)
+	AddLifecycle(ctx context.Context, name string, lifecycle ProjectLifecycle)
+	AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle ProjectLifecycle)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync ProjectHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync ProjectHandlerFunc)
+	AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle ProjectLifecycle)
+	AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle ProjectLifecycle)
 }
 
 type projectLister struct {
@@ -96,7 +127,7 @@ func (l *projectLister) Get(namespace, name string) (*Project, error) {
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    ProjectGroupVersionKind.Group,
 			Resource: "project",
-		}, name)
+		}, key)
 	}
 	return obj.(*Project), nil
 }
@@ -105,40 +136,65 @@ type projectController struct {
 	controller.GenericController
 }
 
+func (c *projectController) Generic() controller.GenericController {
+	return c.GenericController
+}
+
 func (c *projectController) Lister() ProjectLister {
 	return &projectLister{
 		controller: c,
 	}
 }
 
-func (c *projectController) AddHandler(name string, handler ProjectHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *projectController) AddHandler(ctx context.Context, name string, handler ProjectHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*Project); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
-		return handler(key, obj.(*Project))
 	})
 }
 
-func (c *projectController) AddClusterScopedHandler(name, cluster string, handler ProjectHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *projectController) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, handler ProjectHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*Project); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		if !controller.ObjectInCluster(cluster, obj) {
-			return nil
+func (c *projectController) AddClusterScopedHandler(ctx context.Context, name, cluster string, handler ProjectHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*Project); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		return handler(key, obj.(*Project))
+func (c *projectController) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, cluster string, handler ProjectHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*Project); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
+		}
 	})
 }
 
@@ -178,11 +234,11 @@ func (s *projectClient) Controller() ProjectController {
 type projectClient struct {
 	client       *Client
 	ns           string
-	objectClient *clientbase.ObjectClient
+	objectClient *objectclient.ObjectClient
 	controller   ProjectController
 }
 
-func (s *projectClient) ObjectClient() *clientbase.ObjectClient {
+func (s *projectClient) ObjectClient() *objectclient.ObjectClient {
 	return s.objectClient
 }
 
@@ -219,13 +275,18 @@ func (s *projectClient) List(opts metav1.ListOptions) (*ProjectList, error) {
 	return obj.(*ProjectList), err
 }
 
+func (s *projectClient) ListNamespaced(namespace string, opts metav1.ListOptions) (*ProjectList, error) {
+	obj, err := s.objectClient.ListNamespaced(namespace, opts)
+	return obj.(*ProjectList), err
+}
+
 func (s *projectClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	return s.objectClient.Watch(opts)
 }
 
 // Patch applies the patch and returns the patched deployment.
-func (s *projectClient) Patch(o *Project, data []byte, subresources ...string) (*Project, error) {
-	obj, err := s.objectClient.Patch(o.Name, o, data, subresources...)
+func (s *projectClient) Patch(o *Project, patchType types.PatchType, data []byte, subresources ...string) (*Project, error) {
+	obj, err := s.objectClient.Patch(o.Name, o, patchType, data, subresources...)
 	return obj.(*Project), err
 }
 
@@ -233,20 +294,38 @@ func (s *projectClient) DeleteCollection(deleteOpts *metav1.DeleteOptions, listO
 	return s.objectClient.DeleteCollection(deleteOpts, listOpts)
 }
 
-func (s *projectClient) AddHandler(name string, sync ProjectHandlerFunc) {
-	s.Controller().AddHandler(name, sync)
+func (s *projectClient) AddHandler(ctx context.Context, name string, sync ProjectHandlerFunc) {
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *projectClient) AddLifecycle(name string, lifecycle ProjectLifecycle) {
+func (s *projectClient) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync ProjectHandlerFunc) {
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
+}
+
+func (s *projectClient) AddLifecycle(ctx context.Context, name string, lifecycle ProjectLifecycle) {
 	sync := NewProjectLifecycleAdapter(name, false, s, lifecycle)
-	s.AddHandler(name, sync)
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *projectClient) AddClusterScopedHandler(name, clusterName string, sync ProjectHandlerFunc) {
-	s.Controller().AddClusterScopedHandler(name, clusterName, sync)
+func (s *projectClient) AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle ProjectLifecycle) {
+	sync := NewProjectLifecycleAdapter(name, false, s, lifecycle)
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
 }
 
-func (s *projectClient) AddClusterScopedLifecycle(name, clusterName string, lifecycle ProjectLifecycle) {
+func (s *projectClient) AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync ProjectHandlerFunc) {
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *projectClient) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync ProjectHandlerFunc) {
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
+}
+
+func (s *projectClient) AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle ProjectLifecycle) {
 	sync := NewProjectLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
-	s.AddClusterScopedHandler(name, clusterName, sync)
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *projectClient) AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle ProjectLifecycle) {
+	sync := NewProjectLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
 }

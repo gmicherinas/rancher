@@ -5,17 +5,17 @@ import (
 	"net/http"
 
 	"github.com/rancher/norman/httperror"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config/dialer"
 	"k8s.io/client-go/rest"
 )
 
 type Router struct {
-	clusterLookup ClusterLookup
 	serverFactory *factory
 }
 
-func New(localConfig *rest.Config, lookup ClusterLookup, dialer dialer.Factory) http.Handler {
-	serverFactory := newFactory(localConfig, dialer, lookup)
+func New(localConfig *rest.Config, lookup ClusterLookup, dialer dialer.Factory, clusterLister v3.ClusterLister) http.Handler {
+	serverFactory := newFactory(localConfig, dialer, lookup, clusterLister)
 	return &Router{
 		serverFactory: serverFactory,
 	}
@@ -24,7 +24,12 @@ func New(localConfig *rest.Config, lookup ClusterLookup, dialer dialer.Factory) 
 func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	c, handler, err := r.serverFactory.get(req)
 	if err != nil {
-		response(rw, httperror.ServerError, err.Error())
+		e, ok := err.(*httperror.APIError)
+		if ok {
+			response(rw, e.Code, e.Message)
+		} else {
+			response(rw, httperror.ServerError, err.Error())
+		}
 		return
 	}
 

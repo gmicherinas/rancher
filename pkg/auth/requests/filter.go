@@ -4,26 +4,29 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/rancher/rancher/pkg/audit"
+	"github.com/rancher/rancher/pkg/auth/providerrefresh"
 	"github.com/rancher/rancher/pkg/auth/util"
 	"github.com/rancher/types/config"
-	"github.com/sirupsen/logrus"
 )
 
-func NewAuthenticationFilter(ctx context.Context, managementContext *config.ScaledContext, next http.Handler) (http.Handler, error) {
+func NewAuthenticationFilter(ctx context.Context, auth Authenticator, managementContext *config.ScaledContext, next http.Handler) (http.Handler, error) {
 	if managementContext == nil {
 		return nil, fmt.Errorf("Failed to build NewAuthenticationFilter, nil ManagementContext")
 	}
-	auth := NewAuthenticator(ctx, managementContext)
 	return &authHeaderHandler{
-		auth: auth,
-		next: next,
+		auth:              auth,
+		next:              next,
+		userAuthRefresher: providerrefresh.NewUserAuthRefresher(ctx, managementContext),
 	}, nil
 }
 
 type authHeaderHandler struct {
-	auth Authenticator
-	next http.Handler
+	auth              Authenticator
+	next              http.Handler
+	userAuthRefresher providerrefresh.UserAuthRefresher
 }
 
 func (h authHeaderHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -33,13 +36,27 @@ func (h authHeaderHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	logrus.Debugf("Impersonating user %v, groups %v", user, groups)
+	// clean extra
+	for header := range req.Header {
+		if strings.HasPrefix(header, "Impersonate-Extra-") {
+			req.Header.Del(header)
+		}
+	}
 
 	req.Header.Set("Impersonate-User", user)
-
 	req.Header.Del("Impersonate-Group")
 	for _, group := range groups {
 		req.Header.Add("Impersonate-Group", group)
+	}
+
+	auditUser, ok := audit.FromContext(req.Context())
+	if ok {
+		auditUser.Name = user
+		auditUser.Group = groups
+	}
+
+	if !strings.HasPrefix(user, "system:") {
+		go h.userAuthRefresher.TriggerUserRefresh(user, false)
 	}
 
 	h.next.ServeHTTP(rw, req)

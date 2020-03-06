@@ -16,6 +16,7 @@ const (
 	ServiceFieldHealthCheckNodePort      = "healthCheckNodePort"
 	ServiceFieldHostname                 = "hostname"
 	ServiceFieldIPAddresses              = "ipAddresses"
+	ServiceFieldIPFamily                 = "ipFamily"
 	ServiceFieldKind                     = "kind"
 	ServiceFieldLabels                   = "labels"
 	ServiceFieldLoadBalancerIP           = "loadBalancerIP"
@@ -34,9 +35,10 @@ const (
 	ServiceFieldState                    = "state"
 	ServiceFieldTargetDNSRecordIDs       = "targetDnsRecordIds"
 	ServiceFieldTargetWorkloadIDs        = "targetWorkloadIds"
+	ServiceFieldTopologyKeys             = "topologyKeys"
 	ServiceFieldTransitioning            = "transitioning"
 	ServiceFieldTransitioningMessage     = "transitioningMessage"
-	ServiceFieldUuid                     = "uuid"
+	ServiceFieldUUID                     = "uuid"
 	ServiceFieldWorkloadID               = "workloadId"
 )
 
@@ -49,9 +51,10 @@ type Service struct {
 	Description              string                 `json:"description,omitempty" yaml:"description,omitempty"`
 	ExternalIPs              []string               `json:"externalIPs,omitempty" yaml:"externalIPs,omitempty"`
 	ExternalTrafficPolicy    string                 `json:"externalTrafficPolicy,omitempty" yaml:"externalTrafficPolicy,omitempty"`
-	HealthCheckNodePort      *int64                 `json:"healthCheckNodePort,omitempty" yaml:"healthCheckNodePort,omitempty"`
+	HealthCheckNodePort      int64                  `json:"healthCheckNodePort,omitempty" yaml:"healthCheckNodePort,omitempty"`
 	Hostname                 string                 `json:"hostname,omitempty" yaml:"hostname,omitempty"`
 	IPAddresses              []string               `json:"ipAddresses,omitempty" yaml:"ipAddresses,omitempty"`
+	IPFamily                 string                 `json:"ipFamily,omitempty" yaml:"ipFamily,omitempty"`
 	Kind                     string                 `json:"kind,omitempty" yaml:"kind,omitempty"`
 	Labels                   map[string]string      `json:"labels,omitempty" yaml:"labels,omitempty"`
 	LoadBalancerIP           string                 `json:"loadBalancerIP,omitempty" yaml:"loadBalancerIP,omitempty"`
@@ -70,11 +73,13 @@ type Service struct {
 	State                    string                 `json:"state,omitempty" yaml:"state,omitempty"`
 	TargetDNSRecordIDs       []string               `json:"targetDnsRecordIds,omitempty" yaml:"targetDnsRecordIds,omitempty"`
 	TargetWorkloadIDs        []string               `json:"targetWorkloadIds,omitempty" yaml:"targetWorkloadIds,omitempty"`
+	TopologyKeys             []string               `json:"topologyKeys,omitempty" yaml:"topologyKeys,omitempty"`
 	Transitioning            string                 `json:"transitioning,omitempty" yaml:"transitioning,omitempty"`
 	TransitioningMessage     string                 `json:"transitioningMessage,omitempty" yaml:"transitioningMessage,omitempty"`
-	Uuid                     string                 `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                     string                 `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 	WorkloadID               string                 `json:"workloadId,omitempty" yaml:"workloadId,omitempty"`
 }
+
 type ServiceCollection struct {
 	types.Collection
 	Data   []Service `json:"data,omitempty"`
@@ -87,8 +92,10 @@ type ServiceClient struct {
 
 type ServiceOperations interface {
 	List(opts *types.ListOpts) (*ServiceCollection, error)
+	ListAll(opts *types.ListOpts) (*ServiceCollection, error)
 	Create(opts *Service) (*Service, error)
 	Update(existing *Service, updates interface{}) (*Service, error)
+	Replace(existing *Service) (*Service, error)
 	ByID(id string) (*Service, error)
 	Delete(container *Service) error
 }
@@ -111,10 +118,34 @@ func (c *ServiceClient) Update(existing *Service, updates interface{}) (*Service
 	return resp, err
 }
 
+func (c *ServiceClient) Replace(obj *Service) (*Service, error) {
+	resp := &Service{}
+	err := c.apiClient.Ops.DoReplace(ServiceType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *ServiceClient) List(opts *types.ListOpts) (*ServiceCollection, error) {
 	resp := &ServiceCollection{}
 	err := c.apiClient.Ops.DoList(ServiceType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *ServiceClient) ListAll(opts *types.ListOpts) (*ServiceCollection, error) {
+	resp := &ServiceCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

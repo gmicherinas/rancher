@@ -8,6 +8,7 @@ type Client struct {
 	clientbase.APIBaseClient
 
 	PersistentVolumeClaim         PersistentVolumeClaimOperations
+	ConfigMap                     ConfigMapOperations
 	Ingress                       IngressOperations
 	Secret                        SecretOperations
 	ServiceAccountToken           ServiceAccountTokenOperations
@@ -33,7 +34,22 @@ type Client struct {
 	CronJob                       CronJobOperations
 	Workload                      WorkloadOperations
 	App                           AppOperations
-	ConfigMap                     ConfigMapOperations
+	AppRevision                   AppRevisionOperations
+	SourceCodeProvider            SourceCodeProviderOperations
+	SourceCodeProviderConfig      SourceCodeProviderConfigOperations
+	SourceCodeCredential          SourceCodeCredentialOperations
+	Pipeline                      PipelineOperations
+	PipelineExecution             PipelineExecutionOperations
+	PipelineSetting               PipelineSettingOperations
+	SourceCodeRepository          SourceCodeRepositoryOperations
+	Prometheus                    PrometheusOperations
+	ServiceMonitor                ServiceMonitorOperations
+	PrometheusRule                PrometheusRuleOperations
+	Alertmanager                  AlertmanagerOperations
+	HorizontalPodAutoscaler       HorizontalPodAutoscalerOperations
+	VirtualService                VirtualServiceOperations
+	DestinationRule               DestinationRuleOperations
+	Gateway                       GatewayOperations
 }
 
 func NewClient(opts *clientbase.ClientOpts) (*Client, error) {
@@ -47,6 +63,7 @@ func NewClient(opts *clientbase.ClientOpts) (*Client, error) {
 	}
 
 	client.PersistentVolumeClaim = newPersistentVolumeClaimClient(client)
+	client.ConfigMap = newConfigMapClient(client)
 	client.Ingress = newIngressClient(client)
 	client.Secret = newSecretClient(client)
 	client.ServiceAccountToken = newServiceAccountTokenClient(client)
@@ -72,7 +89,22 @@ func NewClient(opts *clientbase.ClientOpts) (*Client, error) {
 	client.CronJob = newCronJobClient(client)
 	client.Workload = newWorkloadClient(client)
 	client.App = newAppClient(client)
-	client.ConfigMap = newConfigMapClient(client)
+	client.AppRevision = newAppRevisionClient(client)
+	client.SourceCodeProvider = newSourceCodeProviderClient(client)
+	client.SourceCodeProviderConfig = newSourceCodeProviderConfigClient(client)
+	client.SourceCodeCredential = newSourceCodeCredentialClient(client)
+	client.Pipeline = newPipelineClient(client)
+	client.PipelineExecution = newPipelineExecutionClient(client)
+	client.PipelineSetting = newPipelineSettingClient(client)
+	client.SourceCodeRepository = newSourceCodeRepositoryClient(client)
+	client.Prometheus = newPrometheusClient(client)
+	client.ServiceMonitor = newServiceMonitorClient(client)
+	client.PrometheusRule = newPrometheusRuleClient(client)
+	client.Alertmanager = newAlertmanagerClient(client)
+	client.HorizontalPodAutoscaler = newHorizontalPodAutoscalerClient(client)
+	client.VirtualService = newVirtualServiceClient(client)
+	client.DestinationRule = newDestinationRuleClient(client)
+	client.Gateway = newGatewayClient(client)
 
 	return client, nil
 }

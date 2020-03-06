@@ -1,94 +1,49 @@
 package rbac
 
 import (
+	"context"
 	"net/http"
-	"strings"
+	"sync"
 
-	"github.com/rancher/norman/authorization"
 	"github.com/rancher/norman/types"
-	"github.com/rancher/types/apis/rbac.authorization.k8s.io/v1"
+	"github.com/rancher/rancher/pkg/features"
+	"github.com/rancher/steve/pkg/accesscontrol"
+	v1 "github.com/rancher/wrangler-api/pkg/generated/controllers/rbac/v1"
 )
 
-type AccessControl struct {
-	authorization.AllAccess
-	permissionStore *ListPermissionStore
+func NewAccessControl(ctx context.Context, clusterName string, rbacClient v1.Interface) types.AccessControl {
+	asl := accesscontrol.NewAccessStore(ctx, features.Steve.Enabled(), rbacClient)
+	return NewAccessControlWithASL(clusterName, rbacClient, asl)
 }
 
-func NewAccessControl(rbacClient v1.Interface) *AccessControl {
-	permissionStore := NewListPermissionStore(rbacClient)
-	return &AccessControl{
-		permissionStore: permissionStore,
-	}
+func isSubscribe(ctx *types.APIContext) bool {
+	return ctx.Request.Method == http.MethodGet && ctx.Type == "subscribe"
 }
 
-func (a *AccessControl) Filter(apiContext *types.APIContext, schema *types.Schema, obj map[string]interface{}, context map[string]string) map[string]interface{} {
-	apiGroup := context["apiGroup"]
-	resource := context["resource"]
-
-	if resource == "" {
-		return obj
-	}
-
-	permset := a.getPermissions(apiContext, apiGroup, resource)
-
-	if a.canAccess(obj, permset) {
-		return obj
-	}
-	return nil
-}
-
-func (a *AccessControl) canAccess(obj map[string]interface{}, permset ListPermissionSet) bool {
-	namespace, _ := obj["namespaceId"].(string)
-	id, _ := obj["id"].(string)
-	if permset.Access(namespace, "*") || permset.Access("*", "*") {
-		return true
-	}
-	return permset.Access(namespace, strings.TrimPrefix(id, namespace+":"))
-}
-
-func (a *AccessControl) FilterList(apiContext *types.APIContext, schema *types.Schema, objs []map[string]interface{}, context map[string]string) []map[string]interface{} {
-	apiGroup := context["apiGroup"]
-	resource := context["resource"]
-
-	if resource == "" {
-		return objs
-	}
-
-	permset := a.getPermissions(apiContext, apiGroup, resource)
-
-	result := make([]map[string]interface{}, 0, len(objs))
-
-	all := permset.Access("*", "*")
-
-	for _, obj := range objs {
-		if all {
-			result = append(result, obj)
-		} else if a.canAccess(obj, permset) {
-			result = append(result, obj)
+func NewAccessControlWithASL(clusterName string, rbacClient v1.Interface, asl accesscontrol.AccessSetLookup) types.AccessControl {
+	var cacheLock sync.RWMutex
+	return newContextBased(func(ctx *types.APIContext) (types.AccessControl, bool) {
+		cache, ok := ctx.Request.Context().Value(contextKey{}).(map[string]types.AccessControl)
+		if !ok {
+			return nil, false
 		}
-	}
 
-	return result
-}
-
-func (a *AccessControl) getPermissions(context *types.APIContext, apiGroup, resource string) ListPermissionSet {
-	permset := a.permissionStore.UserPermissions(getUser(context), apiGroup, resource)
-	if permset == nil {
-		permset = ListPermissionSet{}
-	}
-	for _, group := range getGroups(context) {
-		for k, v := range a.permissionStore.GroupPermissions(group, apiGroup, resource) {
-			permset[k] = v
+		if !isSubscribe(ctx) {
+			cacheLock.RLock()
+			ac, ok := cache[clusterName]
+			if ok {
+				if u, ok := ac.(*userCachedAccess); !ok || !u.Expired() {
+					cacheLock.RUnlock()
+					return ac, true
+				}
+			}
+			cacheLock.RUnlock()
 		}
-	}
 
-	return permset
-}
-
-func getUser(apiContext *types.APIContext) string {
-	return apiContext.Request.Header.Get("Impersonate-User")
-}
-
-func getGroups(apiContext *types.APIContext) []string {
-	return apiContext.Request.Header[http.CanonicalHeaderKey("Impersonate-Group")]
+		cacheLock.Lock()
+		defer cacheLock.Unlock()
+		ac := newUserLookupAccess(ctx, asl)
+		cache[clusterName] = ac
+		return ac, true
+	})
 }

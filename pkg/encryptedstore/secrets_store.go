@@ -3,11 +3,10 @@ package encryptedstore
 import (
 	"reflect"
 
-	"github.com/rancher/types/apis/core/v1"
+	v1 "github.com/rancher/types/apis/core/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	typedv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
 const (
@@ -15,12 +14,13 @@ const (
 )
 
 type GenericEncryptedStore struct {
-	prefix    string
-	namespace string
-	secrets   typedv1.SecretsGetter
+	prefix       string
+	namespace    string
+	secrets      v1.SecretInterface
+	secretLister v1.SecretLister
 }
 
-func NewGenericEncrypedStore(prefix, namespace string, namespaceInterface v1.NamespaceInterface, secrets typedv1.SecretsGetter) (*GenericEncryptedStore, error) {
+func NewGenericEncrypedStore(prefix, namespace string, namespaceInterface v1.NamespaceInterface, secretsGetter v1.SecretsGetter) (*GenericEncryptedStore, error) {
 	if namespace == "" {
 		namespace = defaultNamespace
 	}
@@ -37,14 +37,15 @@ func NewGenericEncrypedStore(prefix, namespace string, namespaceInterface v1.Nam
 	}
 
 	return &GenericEncryptedStore{
-		prefix:    prefix,
-		namespace: namespace,
-		secrets:   secrets,
+		prefix:       prefix,
+		namespace:    namespace,
+		secrets:      secretsGetter.Secrets(namespace),
+		secretLister: secretsGetter.Secrets(namespace).Controller().Lister(),
 	}, nil
 }
 
 func (g *GenericEncryptedStore) Get(name string) (map[string]string, error) {
-	sec, err := g.secrets.Secrets(g.namespace).Get(g.getKey(name), metav1.GetOptions{})
+	sec, err := g.secretLister.Get(g.namespace, g.getKey(name))
 	if err != nil {
 		return nil, err
 	}
@@ -66,13 +67,15 @@ func (g *GenericEncryptedStore) Set(name string, data map[string]string) error {
 }
 
 func (g *GenericEncryptedStore) set(name string, data map[string]string, try int) error {
-	sec, err := g.secrets.Secrets(g.namespace).Get(g.getKey(name), metav1.GetOptions{})
+	sec, err := g.secretLister.Get(g.namespace, g.getKey(name))
 	if errors.IsNotFound(err) {
 		sec = &corev1.Secret{}
 		sec.Name = g.getKey(name)
 		sec.StringData = data
-		_, err := g.secrets.Secrets(g.namespace).Create(sec)
-		return err
+		if _, err := g.secrets.Create(sec); err != nil && !errors.IsAlreadyExists(err) {
+			return err
+		}
+		return nil
 	} else if err != nil {
 		return err
 	}
@@ -86,7 +89,7 @@ func (g *GenericEncryptedStore) set(name string, data map[string]string, try int
 	}
 
 	if !reflect.DeepEqual(orig, sec) {
-		_, err = g.secrets.Secrets(g.namespace).Update(sec)
+		_, err = g.secrets.Update(sec)
 		if err != nil && try < 5 {
 			return g.set(name, data, try+1)
 		}
@@ -95,7 +98,7 @@ func (g *GenericEncryptedStore) set(name string, data map[string]string, try int
 }
 
 func (g *GenericEncryptedStore) Remove(name string) error {
-	err := g.secrets.Secrets(g.namespace).Delete(g.getKey(name), nil)
+	err := g.secrets.Delete(g.getKey(name), nil)
 	if errors.IsNotFound(err) {
 		return nil
 	}

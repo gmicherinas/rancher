@@ -2,27 +2,24 @@ package types
 
 import (
 	"fmt"
+	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
-
-	"net/http"
 
 	"github.com/rancher/norman/types/convert"
 	"github.com/rancher/norman/types/definition"
 	"github.com/rancher/norman/types/slice"
 	"github.com/sirupsen/logrus"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
 	namespacedType = reflect.TypeOf(Namespaced{})
 	resourceType   = reflect.TypeOf(Resource{})
-	typeType       = reflect.TypeOf(metav1.TypeMeta{})
-	metaType       = reflect.TypeOf(metav1.ObjectMeta{})
 	blacklistNames = map[string]bool{
-		"links":   true,
-		"actions": true,
+		"links":         true,
+		"actions":       true,
+		"managedFields": true,
 	}
 )
 
@@ -52,6 +49,10 @@ func (s *Schemas) AddMapperForType(version *APIVersion, obj interface{}, mapper 
 }
 
 func (s *Schemas) MustImport(version *APIVersion, obj interface{}, externalOverrides ...interface{}) *Schemas {
+	if reflect.ValueOf(obj).Kind() == reflect.Ptr {
+		panic(fmt.Errorf("obj cannot be a pointer"))
+	}
+
 	if _, err := s.Import(version, obj, externalOverrides...); err != nil {
 		panic(err)
 	}
@@ -83,6 +84,9 @@ func (s *Schemas) newSchemaFromType(version *APIVersion, t reflect.Type, typeNam
 		CollectionActions: map[string]Action{},
 	}
 
+	s.processingTypes[t] = schema
+	defer delete(s.processingTypes, t)
+
 	if err := s.readFields(schema, t); err != nil {
 		return nil, err
 	}
@@ -99,6 +103,12 @@ func (s *Schemas) setupFilters(schema *Schema) {
 		switch field.Type {
 		case "enum":
 			mods = []ModifierType{ModifierEQ, ModifierNE, ModifierIn, ModifierNotIn}
+		case "date":
+			fallthrough
+		case "dnsLabel":
+			fallthrough
+		case "hostname":
+			fallthrough
 		case "string":
 			mods = []ModifierType{ModifierEQ, ModifierNE, ModifierIn, ModifierNotIn}
 		case "int":
@@ -142,6 +152,11 @@ func (s *Schemas) importType(version *APIVersion, t reflect.Type, overrides ...r
 		return existing, nil
 	}
 
+	if s, ok := s.processingTypes[t]; ok {
+		logrus.Debugf("Returning half built schema %s for %v", typeName, t)
+		return s, nil
+	}
+
 	logrus.Debugf("Inspecting schema %s for %v", typeName, t)
 
 	schema, err := s.newSchemaFromType(version, t, typeName)
@@ -151,7 +166,7 @@ func (s *Schemas) importType(version *APIVersion, t reflect.Type, overrides ...r
 
 	mappers := s.mapper(&schema.Version, schema.ID)
 	if s.DefaultMappers != nil {
-		if schema.CanList(nil) {
+		if schema.CanList(nil) == nil {
 			mappers = append(s.DefaultMappers(), mappers...)
 		}
 	}
@@ -175,7 +190,7 @@ func (s *Schemas) importType(version *APIVersion, t reflect.Type, overrides ...r
 
 	mapper := &typeMapper{
 		Mappers: mappers,
-		root:    schema.CanList(nil),
+		root:    schema.CanList(nil) == nil,
 	}
 
 	if err := mapper.ModifySchema(schema, s); err != nil {
@@ -192,6 +207,16 @@ func (s *Schemas) importType(version *APIVersion, t reflect.Type, overrides ...r
 
 func jsonName(f reflect.StructField) string {
 	return strings.SplitN(f.Tag.Get("json"), ",", 2)[0]
+}
+
+func k8sType(field reflect.StructField) bool {
+	return field.Type.Name() == "TypeMeta" &&
+		strings.HasSuffix(field.Type.PkgPath(), "k8s.io/apimachinery/pkg/apis/meta/v1")
+}
+
+func k8sObject(field reflect.StructField) bool {
+	return field.Type.Name() == "ObjectMeta" &&
+		strings.HasSuffix(field.Type.PkgPath(), "k8s.io/apimachinery/pkg/apis/meta/v1")
 }
 
 func (s *Schemas) readFields(schema *Schema, t reflect.Type) error {
@@ -212,16 +237,15 @@ func (s *Schemas) readFields(schema *Schema, t reflect.Type) error {
 		}
 
 		jsonName := jsonName(field)
-
 		if jsonName == "-" {
 			continue
 		}
 
-		if field.Anonymous && jsonName == "" && field.Type == typeType {
+		if field.Anonymous && jsonName == "" && k8sType(field) {
 			hasType = true
 		}
 
-		if field.Anonymous && jsonName == "metadata" && field.Type == metaType {
+		if field.Anonymous && jsonName == "metadata" && k8sObject(field) {
 			hasMeta = true
 		}
 
@@ -270,6 +294,15 @@ func (s *Schemas) readFields(schema *Schema, t reflect.Type) error {
 		} else if fieldType.Kind() == reflect.Bool {
 			schemaField.Nullable = false
 			schemaField.Default = false
+		} else if fieldType.Kind() == reflect.Int ||
+			fieldType.Kind() == reflect.Uint32 ||
+			fieldType.Kind() == reflect.Int32 ||
+			fieldType.Kind() == reflect.Uint64 ||
+			fieldType.Kind() == reflect.Int64 ||
+			fieldType.Kind() == reflect.Float32 ||
+			fieldType.Kind() == reflect.Float64 {
+			schemaField.Nullable = false
+			schemaField.Default = 0
 		}
 
 		if err := applyTag(&field, &schemaField); err != nil {
@@ -279,7 +312,7 @@ func (s *Schemas) readFields(schema *Schema, t reflect.Type) error {
 		if schemaField.Type == "" {
 			inferedType, err := s.determineSchemaType(&schema.Version, fieldType)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed inspecting type %s, field %s: %v", t, fieldName, err)
 			}
 			schemaField.Type = inferedType
 		}
@@ -288,6 +321,12 @@ func (s *Schemas) readFields(schema *Schema, t reflect.Type) error {
 			switch schemaField.Type {
 			case "int":
 				n, err := convert.ToNumber(schemaField.Default)
+				if err != nil {
+					return err
+				}
+				schemaField.Default = n
+			case "float":
+				n, err := convert.ToFloat(schemaField.Default)
 				if err != nil {
 					return err
 				}
@@ -401,6 +440,13 @@ func getKeyValue(input string) (string, string) {
 	return key, value
 }
 
+func deRef(p reflect.Type) reflect.Type {
+	if p.Kind() == reflect.Ptr {
+		return p.Elem()
+	}
+	return p
+}
+
 func (s *Schemas) determineSchemaType(version *APIVersion, t reflect.Type) (string, error) {
 	switch t.Kind() {
 	case reflect.Uint8:
@@ -411,18 +457,26 @@ func (s *Schemas) determineSchemaType(version *APIVersion, t reflect.Type) (stri
 		fallthrough
 	case reflect.Int32:
 		fallthrough
+	case reflect.Uint32:
+		fallthrough
+	case reflect.Uint64:
+		fallthrough
 	case reflect.Int64:
 		return "int", nil
+	case reflect.Float32:
+		fallthrough
+	case reflect.Float64:
+		return "float", nil
 	case reflect.Interface:
 		return "json", nil
 	case reflect.Map:
-		subType, err := s.determineSchemaType(version, t.Elem())
+		subType, err := s.determineSchemaType(version, deRef(t.Elem()))
 		if err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("map[%s]", subType), nil
 	case reflect.Slice:
-		subType, err := s.determineSchemaType(version, t.Elem())
+		subType, err := s.determineSchemaType(version, deRef(t.Elem()))
 		if err != nil {
 			return "", err
 		}

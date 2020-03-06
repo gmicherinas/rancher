@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type NodePoolLifecycle interface {
-	Create(obj *NodePool) (*NodePool, error)
-	Remove(obj *NodePool) (*NodePool, error)
-	Updated(obj *NodePool) (*NodePool, error)
+	Create(obj *NodePool) (runtime.Object, error)
+	Remove(obj *NodePool) (runtime.Object, error)
+	Updated(obj *NodePool) (runtime.Object, error)
 }
 
 type nodePoolLifecycleAdapter struct {
 	lifecycle NodePoolLifecycle
+}
+
+func (w *nodePoolLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *nodePoolLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *nodePoolLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *nodePoolLifecycleAdapter) Updated(obj runtime.Object) (runtime.Object, 
 }
 
 func NewNodePoolLifecycleAdapter(name string, clusterScoped bool, client NodePoolInterface, l NodePoolLifecycle) NodePoolHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(NodePoolGroupVersionResource)
+	}
 	adapter := &nodePoolLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *NodePool) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *NodePool) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

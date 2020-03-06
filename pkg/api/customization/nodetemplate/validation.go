@@ -11,10 +11,8 @@ func Validator(request *types.APIContext, schema *types.Schema, data map[string]
 	if driver == "" {
 		return httperror.NewAPIError(httperror.MissingRequired, "a Config field must be set")
 	}
-
 	if data != nil {
 		data["driver"] = driver
 	}
-
 	return nil
 }

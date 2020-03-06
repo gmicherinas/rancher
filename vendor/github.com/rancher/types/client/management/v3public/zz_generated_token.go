@@ -4,9 +4,12 @@ const (
 	TokenType                 = "token"
 	TokenFieldAnnotations     = "annotations"
 	TokenFieldAuthProvider    = "authProvider"
+	TokenFieldClusterID       = "clusterId"
 	TokenFieldCreated         = "created"
 	TokenFieldCreatorID       = "creatorId"
+	TokenFieldCurrent         = "current"
 	TokenFieldDescription     = "description"
+	TokenFieldEnabled         = "enabled"
 	TokenFieldExpired         = "expired"
 	TokenFieldExpiresAt       = "expiresAt"
 	TokenFieldGroupPrincipals = "groupPrincipals"
@@ -19,17 +22,20 @@ const (
 	TokenFieldRemoved         = "removed"
 	TokenFieldTTLMillis       = "ttl"
 	TokenFieldToken           = "token"
+	TokenFieldUUID            = "uuid"
 	TokenFieldUserID          = "userId"
 	TokenFieldUserPrincipal   = "userPrincipal"
-	TokenFieldUuid            = "uuid"
 )
 
 type Token struct {
 	Annotations     map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
 	AuthProvider    string            `json:"authProvider,omitempty" yaml:"authProvider,omitempty"`
+	ClusterID       string            `json:"clusterId,omitempty" yaml:"clusterId,omitempty"`
 	Created         string            `json:"created,omitempty" yaml:"created,omitempty"`
 	CreatorID       string            `json:"creatorId,omitempty" yaml:"creatorId,omitempty"`
+	Current         bool              `json:"current,omitempty" yaml:"current,omitempty"`
 	Description     string            `json:"description,omitempty" yaml:"description,omitempty"`
+	Enabled         *bool             `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 	Expired         bool              `json:"expired,omitempty" yaml:"expired,omitempty"`
 	ExpiresAt       string            `json:"expiresAt,omitempty" yaml:"expiresAt,omitempty"`
 	GroupPrincipals []string          `json:"groupPrincipals,omitempty" yaml:"groupPrincipals,omitempty"`
@@ -40,9 +46,9 @@ type Token struct {
 	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	ProviderInfo    map[string]string `json:"providerInfo,omitempty" yaml:"providerInfo,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
-	TTLMillis       *int64            `json:"ttl,omitempty" yaml:"ttl,omitempty"`
+	TTLMillis       int64             `json:"ttl,omitempty" yaml:"ttl,omitempty"`
 	Token           string            `json:"token,omitempty" yaml:"token,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 	UserID          string            `json:"userId,omitempty" yaml:"userId,omitempty"`
 	UserPrincipal   string            `json:"userPrincipal,omitempty" yaml:"userPrincipal,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }

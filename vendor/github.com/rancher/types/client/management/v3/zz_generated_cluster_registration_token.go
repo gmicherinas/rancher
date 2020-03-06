@@ -7,7 +7,7 @@ import (
 const (
 	ClusterRegistrationTokenType                      = "clusterRegistrationToken"
 	ClusterRegistrationTokenFieldAnnotations          = "annotations"
-	ClusterRegistrationTokenFieldClusterId            = "clusterId"
+	ClusterRegistrationTokenFieldClusterID            = "clusterId"
 	ClusterRegistrationTokenFieldCommand              = "command"
 	ClusterRegistrationTokenFieldCreated              = "created"
 	ClusterRegistrationTokenFieldCreatorID            = "creatorId"
@@ -23,13 +23,14 @@ const (
 	ClusterRegistrationTokenFieldToken                = "token"
 	ClusterRegistrationTokenFieldTransitioning        = "transitioning"
 	ClusterRegistrationTokenFieldTransitioningMessage = "transitioningMessage"
-	ClusterRegistrationTokenFieldUuid                 = "uuid"
+	ClusterRegistrationTokenFieldUUID                 = "uuid"
+	ClusterRegistrationTokenFieldWindowsNodeCommand   = "windowsNodeCommand"
 )
 
 type ClusterRegistrationToken struct {
 	types.Resource
 	Annotations          map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
-	ClusterId            string            `json:"clusterId,omitempty" yaml:"clusterId,omitempty"`
+	ClusterID            string            `json:"clusterId,omitempty" yaml:"clusterId,omitempty"`
 	Command              string            `json:"command,omitempty" yaml:"command,omitempty"`
 	Created              string            `json:"created,omitempty" yaml:"created,omitempty"`
 	CreatorID            string            `json:"creatorId,omitempty" yaml:"creatorId,omitempty"`
@@ -45,8 +46,10 @@ type ClusterRegistrationToken struct {
 	Token                string            `json:"token,omitempty" yaml:"token,omitempty"`
 	Transitioning        string            `json:"transitioning,omitempty" yaml:"transitioning,omitempty"`
 	TransitioningMessage string            `json:"transitioningMessage,omitempty" yaml:"transitioningMessage,omitempty"`
-	Uuid                 string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                 string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	WindowsNodeCommand   string            `json:"windowsNodeCommand,omitempty" yaml:"windowsNodeCommand,omitempty"`
 }
+
 type ClusterRegistrationTokenCollection struct {
 	types.Collection
 	Data   []ClusterRegistrationToken `json:"data,omitempty"`
@@ -59,8 +62,10 @@ type ClusterRegistrationTokenClient struct {
 
 type ClusterRegistrationTokenOperations interface {
 	List(opts *types.ListOpts) (*ClusterRegistrationTokenCollection, error)
+	ListAll(opts *types.ListOpts) (*ClusterRegistrationTokenCollection, error)
 	Create(opts *ClusterRegistrationToken) (*ClusterRegistrationToken, error)
 	Update(existing *ClusterRegistrationToken, updates interface{}) (*ClusterRegistrationToken, error)
+	Replace(existing *ClusterRegistrationToken) (*ClusterRegistrationToken, error)
 	ByID(id string) (*ClusterRegistrationToken, error)
 	Delete(container *ClusterRegistrationToken) error
 }
@@ -83,10 +88,34 @@ func (c *ClusterRegistrationTokenClient) Update(existing *ClusterRegistrationTok
 	return resp, err
 }
 
+func (c *ClusterRegistrationTokenClient) Replace(obj *ClusterRegistrationToken) (*ClusterRegistrationToken, error) {
+	resp := &ClusterRegistrationToken{}
+	err := c.apiClient.Ops.DoReplace(ClusterRegistrationTokenType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *ClusterRegistrationTokenClient) List(opts *types.ListOpts) (*ClusterRegistrationTokenCollection, error) {
 	resp := &ClusterRegistrationTokenCollection{}
 	err := c.apiClient.Ops.DoList(ClusterRegistrationTokenType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *ClusterRegistrationTokenClient) ListAll(opts *types.ListOpts) (*ClusterRegistrationTokenCollection, error) {
+	resp := &ClusterRegistrationTokenCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

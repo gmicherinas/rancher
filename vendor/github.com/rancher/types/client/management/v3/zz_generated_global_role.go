@@ -13,10 +13,11 @@ const (
 	GlobalRoleFieldDescription     = "description"
 	GlobalRoleFieldLabels          = "labels"
 	GlobalRoleFieldName            = "name"
+	GlobalRoleFieldNewUserDefault  = "newUserDefault"
 	GlobalRoleFieldOwnerReferences = "ownerReferences"
 	GlobalRoleFieldRemoved         = "removed"
 	GlobalRoleFieldRules           = "rules"
-	GlobalRoleFieldUuid            = "uuid"
+	GlobalRoleFieldUUID            = "uuid"
 )
 
 type GlobalRole struct {
@@ -28,11 +29,13 @@ type GlobalRole struct {
 	Description     string            `json:"description,omitempty" yaml:"description,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
 	Name            string            `json:"name,omitempty" yaml:"name,omitempty"`
+	NewUserDefault  bool              `json:"newUserDefault,omitempty" yaml:"newUserDefault,omitempty"`
 	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
 	Rules           []PolicyRule      `json:"rules,omitempty" yaml:"rules,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type GlobalRoleCollection struct {
 	types.Collection
 	Data   []GlobalRole `json:"data,omitempty"`
@@ -45,8 +48,10 @@ type GlobalRoleClient struct {
 
 type GlobalRoleOperations interface {
 	List(opts *types.ListOpts) (*GlobalRoleCollection, error)
+	ListAll(opts *types.ListOpts) (*GlobalRoleCollection, error)
 	Create(opts *GlobalRole) (*GlobalRole, error)
 	Update(existing *GlobalRole, updates interface{}) (*GlobalRole, error)
+	Replace(existing *GlobalRole) (*GlobalRole, error)
 	ByID(id string) (*GlobalRole, error)
 	Delete(container *GlobalRole) error
 }
@@ -69,10 +74,34 @@ func (c *GlobalRoleClient) Update(existing *GlobalRole, updates interface{}) (*G
 	return resp, err
 }
 
+func (c *GlobalRoleClient) Replace(obj *GlobalRole) (*GlobalRole, error) {
+	resp := &GlobalRole{}
+	err := c.apiClient.Ops.DoReplace(GlobalRoleType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *GlobalRoleClient) List(opts *types.ListOpts) (*GlobalRoleCollection, error) {
 	resp := &GlobalRoleCollection{}
 	err := c.apiClient.Ops.DoList(GlobalRoleType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *GlobalRoleClient) ListAll(opts *types.ListOpts) (*GlobalRoleCollection, error) {
+	resp := &GlobalRoleCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

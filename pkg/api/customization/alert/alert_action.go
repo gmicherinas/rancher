@@ -7,31 +7,40 @@ import (
 	"github.com/rancher/norman/api/access"
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/types/config/dialer"
 	"github.com/sirupsen/logrus"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type Handler struct {
-	ClusterAlerts v3.ClusterAlertInterface
-	ProjectAlerts v3.ProjectAlertInterface
-	Notifiers     v3.NotifierInterface
+	ClusterAlertRule v3.ClusterAlertRuleInterface
+	ProjectAlertRule v3.ProjectAlertRuleInterface
+	Notifiers        v3.NotifierInterface
+	DialerFactory    dialer.Factory
 }
 
-func Formatter(apiContext *types.APIContext, resource *types.RawResource) {
+func RuleFormatter(apiContext *types.APIContext, resource *types.RawResource) {
 	resource.AddAction(apiContext, "unmute")
 	resource.AddAction(apiContext, "activate")
 	resource.AddAction(apiContext, "mute")
 	resource.AddAction(apiContext, "deactivate")
 }
 
-func (h *Handler) ClusterActionHandler(actionName string, action *types.Action, request *types.APIContext) error {
+func GroupFormatter(apiContext *types.APIContext, resource *types.RawResource) {
+	resource.AddAction(apiContext, "unmute")
+	resource.AddAction(apiContext, "activate")
+	resource.AddAction(apiContext, "mute")
+	resource.AddAction(apiContext, "deactivate")
+}
+
+func (h *Handler) ClusterAlertRuleActionHandler(actionName string, action *types.Action, request *types.APIContext) error {
 	parts := strings.Split(request.ID, ":")
 	ns := parts[0]
 	id := parts[1]
 
-	alert, err := h.ClusterAlerts.GetNamespaced(ns, id, metav1.GetOptions{})
+	alert, err := h.ClusterAlertRule.GetNamespaced(ns, id, metav1.GetOptions{})
 	if err != nil {
 		logrus.Errorf("Error while getting alert for %s :%v", request.ID, err)
 		return err
@@ -67,7 +76,7 @@ func (h *Handler) ClusterActionHandler(actionName string, action *types.Action, 
 		}
 	}
 
-	alert, err = h.ClusterAlerts.Update(alert)
+	alert, err = h.ClusterAlertRule.Update(alert)
 	if err != nil {
 		logrus.Errorf("Error while updating alert:%v", err)
 		return err
@@ -81,12 +90,12 @@ func (h *Handler) ClusterActionHandler(actionName string, action *types.Action, 
 	return nil
 }
 
-func (h *Handler) ProjectActionHandler(actionName string, action *types.Action, request *types.APIContext) error {
+func (h *Handler) ProjectAlertRuleActionHandler(actionName string, action *types.Action, request *types.APIContext) error {
 	parts := strings.Split(request.ID, ":")
 	ns := parts[0]
 	id := parts[1]
 
-	alert, err := h.ProjectAlerts.GetNamespaced(ns, id, metav1.GetOptions{})
+	alert, err := h.ProjectAlertRule.GetNamespaced(ns, id, metav1.GetOptions{})
 	if err != nil {
 		logrus.Errorf("Error while getting alert for %s :%v", request.ID, err)
 		return err
@@ -122,7 +131,7 @@ func (h *Handler) ProjectActionHandler(actionName string, action *types.Action, 
 		}
 	}
 
-	alert, err = h.ProjectAlerts.Update(alert)
+	alert, err = h.ProjectAlertRule.Update(alert)
 	if err != nil {
 		logrus.Errorf("Error while updating alert:%v", err)
 		return err

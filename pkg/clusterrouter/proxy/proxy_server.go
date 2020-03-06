@@ -4,12 +4,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/rancher/norman/httperror"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config/dialer"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/proxy"
@@ -17,15 +19,28 @@ import (
 )
 
 type RemoteService struct {
+	sync.Mutex
+
 	cluster   *v3.Cluster
-	transport http.RoundTripper
-	url       *url.URL
-	auth      string
+	transport transportGetter
+	url       urlGetter
+	auth      authGetter
+
+	factory       dialer.Factory
+	clusterLister v3.ClusterLister
+	caCert        string
+	httpTransport *http.Transport
 }
 
 var (
 	er = &errorResponder{}
 )
+
+type urlGetter func() (url.URL, error)
+
+type authGetter func() (string, error)
+
+type transportGetter func() (http.RoundTripper, error)
 
 type errorResponder struct {
 }
@@ -39,11 +54,11 @@ func prefix(cluster *v3.Cluster) string {
 	return "/k8s/clusters/" + cluster.Name
 }
 
-func New(localConfig *rest.Config, cluster *v3.Cluster, factory dialer.Factory) (*RemoteService, error) {
+func New(localConfig *rest.Config, cluster *v3.Cluster, clusterLister v3.ClusterLister, factory dialer.Factory) (*RemoteService, error) {
 	if cluster.Spec.Internal {
 		return NewLocal(localConfig, cluster)
 	}
-	return NewRemote(cluster, factory)
+	return NewRemote(cluster, clusterLister, factory)
 }
 
 func NewLocal(localConfig *rest.Config, cluster *v3.Cluster) (*RemoteService, error) {
@@ -58,30 +73,84 @@ func NewLocal(localConfig *rest.Config, cluster *v3.Cluster) (*RemoteService, er
 		return nil, err
 	}
 
-	return &RemoteService{
-		cluster:   cluster,
-		url:       hostURL,
-		transport: transport,
-	}, nil
+	transportGetter := func() (http.RoundTripper, error) {
+		return transport, nil
+	}
+
+	rs := &RemoteService{
+		cluster: cluster,
+		url: func() (url.URL, error) {
+			return *hostURL, nil
+		},
+		transport: transportGetter,
+	}
+	if localConfig.BearerToken != "" {
+		rs.auth = func() (string, error) { return "Bearer " + localConfig.BearerToken, nil }
+	} else if localConfig.Password != "" {
+		rs.auth = func() (string, error) {
+			return "Basic " + base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", localConfig.Username, localConfig.Password))), nil
+		}
+	}
+
+	return rs, nil
 }
 
-func NewRemote(cluster *v3.Cluster, factory dialer.Factory) (*RemoteService, error) {
+func NewRemote(cluster *v3.Cluster, clusterLister v3.ClusterLister, factory dialer.Factory) (*RemoteService, error) {
 	if !v3.ClusterConditionProvisioned.IsTrue(cluster) {
 		return nil, httperror.NewAPIError(httperror.ClusterUnavailable, "cluster not provisioned")
 	}
 
-	transport := &http.Transport{}
-
-	if factory != nil {
-		d, err := factory.ClusterDialer(cluster.Name)
+	urlGetter := func() (url.URL, error) {
+		newCluster, err := clusterLister.Get("", cluster.Name)
 		if err != nil {
-			return nil, err
+			return url.URL{}, err
 		}
-		transport.Dial = d
+
+		u, err := url.Parse(newCluster.Status.APIEndpoint)
+		if err != nil {
+			return url.URL{}, err
+		}
+		return *u, nil
 	}
 
-	if cluster.Status.CACert != "" {
-		certBytes, err := base64.StdEncoding.DecodeString(cluster.Status.CACert)
+	authGetter := func() (string, error) {
+		newCluster, err := clusterLister.Get("", cluster.Name)
+		if err != nil {
+			return "", err
+		}
+
+		return "Bearer " + newCluster.Status.ServiceAccountToken, nil
+	}
+
+	return &RemoteService{
+		cluster:       cluster,
+		url:           urlGetter,
+		auth:          authGetter,
+		clusterLister: clusterLister,
+		factory:       factory,
+	}, nil
+}
+
+func (r *RemoteService) getTransport() (http.RoundTripper, error) {
+	if r.transport != nil {
+		return r.transport()
+	}
+
+	newCluster, err := r.clusterLister.Get("", r.cluster.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	r.Lock()
+	defer r.Unlock()
+
+	if r.httpTransport != nil && !r.cacertChanged(newCluster) {
+		return r.httpTransport, nil
+	}
+
+	transport := &http.Transport{}
+	if newCluster.Status.CACert != "" {
+		certBytes, err := base64.StdEncoding.DecodeString(newCluster.Status.CACert)
 		if err != nil {
 			return nil, err
 		}
@@ -92,20 +161,31 @@ func NewRemote(cluster *v3.Cluster, factory dialer.Factory) (*RemoteService, err
 		}
 	}
 
-	u, err := url.Parse(cluster.Status.APIEndpoint)
-	if err != nil {
-		return nil, err
+	if r.factory != nil {
+		d, err := r.factory.ClusterDialer(newCluster.Name)
+		if err != nil {
+			return nil, err
+		}
+		transport.Dial = d
 	}
 
-	return &RemoteService{
-		cluster:   cluster,
-		transport: transport,
-		url:       u,
-		auth:      "Bearer " + cluster.Status.ServiceAccountToken,
-	}, nil
+	r.caCert = newCluster.Status.CACert
+	if r.httpTransport != nil {
+		r.httpTransport.CloseIdleConnections()
+	}
+	r.httpTransport = transport
+
+	return transport, nil
+}
+
+func (r *RemoteService) cacertChanged(cluster *v3.Cluster) bool {
+	return r.caCert != cluster.Status.CACert
 }
 
 func (r *RemoteService) Close() {
+	if r.httpTransport != nil {
+		r.httpTransport.CloseIdleConnections()
+	}
 }
 
 func (r *RemoteService) Handler() http.Handler {
@@ -113,7 +193,12 @@ func (r *RemoteService) Handler() http.Handler {
 }
 
 func (r *RemoteService) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	u := *r.url
+	u, err := r.url()
+	if err != nil {
+		er.Error(rw, req, err)
+		return
+	}
+
 	u.Path = strings.TrimPrefix(req.URL.Path, prefix(r.cluster))
 	u.RawQuery = req.URL.RawQuery
 
@@ -127,51 +212,25 @@ func (r *RemoteService) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	req.URL.Host = req.Host
-	if r.auth != "" {
-		req.Header.Set("Authorization", r.auth)
+	if r.auth == nil {
+		req.Header.Del("Authorization")
+	} else {
+		token, err := r.auth()
+		if err != nil {
+			er.Error(rw, req, err)
+			return
+		}
+		req.Header.Set("Authorization", token)
 	}
-
-	httpProxy := proxy.NewUpgradeAwareHandler(&u, r.transport, true, false, er)
+	transport, err := r.getTransport()
+	if err != nil {
+		er.Error(rw, req, err)
+		return
+	}
+	httpProxy := proxy.NewUpgradeAwareHandler(&u, transport, true, false, er)
 	httpProxy.ServeHTTP(rw, req)
 }
 
 func (r *RemoteService) Cluster() *v3.Cluster {
 	return r.cluster
-}
-
-type SimpleProxy struct {
-	url       *url.URL
-	transport http.RoundTripper
-}
-
-func NewSimpleProxy(host string, caData []byte) (*SimpleProxy, error) {
-	hostURL, _, err := rest.DefaultServerURL(host, "", schema.GroupVersion{}, true)
-	if err != nil {
-		return nil, err
-	}
-
-	ht := &http.Transport{}
-	if len(caData) > 0 {
-		certPool := x509.NewCertPool()
-		certPool.AppendCertsFromPEM(caData)
-		ht.TLSClientConfig = &tls.Config{
-			RootCAs: certPool,
-		}
-	}
-
-	return &SimpleProxy{
-		url:       hostURL,
-		transport: ht,
-	}, nil
-}
-
-func (s *SimpleProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	u := *s.url
-	u.Path = req.URL.Path
-	u.RawQuery = req.URL.RawQuery
-	req.URL.Scheme = "https"
-	req.URL.Host = req.Host
-	httpProxy := proxy.NewUpgradeAwareHandler(&u, s.transport, true, false, er)
-	httpProxy.ServeHTTP(rw, req)
-
 }

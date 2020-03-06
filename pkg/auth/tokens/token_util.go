@@ -2,16 +2,14 @@ package tokens
 
 import (
 	"encoding/base64"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 )
 
@@ -88,45 +86,6 @@ func GetTokenAuthFromRequest(req *http.Request) string {
 	return tokenAuthValue
 }
 
-func CreateTokenAndSetCookie(userID string, userPrincipal v3.Principal, groupPrincipals []v3.Principal, providerInfo map[string]string, ttl int, description string, request *types.APIContext) error {
-	token, err := NewLoginToken(userID, userPrincipal, groupPrincipals, providerInfo, 0, description)
-	if err != nil {
-		logrus.Errorf("Failed creating token with error: %v", err)
-		return httperror.NewAPIErrorLong(500, "", fmt.Sprintf("Failed creating token with error: %v", err))
-	}
-
-	isSecure := false
-	if request.Request.URL.Scheme == "https" {
-		isSecure = true
-	}
-
-	tokenCookie := &http.Cookie{
-		Name:     CookieName,
-		Value:    token.ObjectMeta.Name + ":" + token.Token,
-		Secure:   isSecure,
-		Path:     "/",
-		HttpOnly: true,
-	}
-	http.SetCookie(request.Response, tokenCookie)
-	request.WriteResponse(http.StatusOK, nil)
-
-	return nil
-}
-
-func NewLoginToken(userID string, userPrincipal v3.Principal, groupPrincipals []v3.Principal, providerInfo map[string]string, ttl int64, description string) (v3.Token, error) {
-	token := &v3.Token{
-		UserPrincipal:   userPrincipal,
-		GroupPrincipals: groupPrincipals,
-		IsDerived:       false,
-		TTLMillis:       ttl,
-		UserID:          userID,
-		AuthProvider:    getAuthProviderName(userPrincipal.Name),
-		ProviderInfo:    providerInfo,
-		Description:     description,
-	}
-	return tokenServer.createK8sTokenCR(token)
-}
-
 func ConvertTokenResource(schema *types.Schema, token v3.Token) (map[string]interface{}, error) {
 	tokenData, err := convert.EncodeToMap(token)
 	if err != nil {
@@ -139,4 +98,36 @@ func ConvertTokenResource(schema *types.Schema, token v3.Token) (map[string]inte
 	mapper.FromInternal(tokenData)
 
 	return tokenData, nil
+}
+
+// Given a stored token with hashed key, check if the provided (unhashed) tokenKey matches and is valid
+func VerifyToken(storedToken *v3.Token, tokenName, tokenKey string) (int, error) {
+	if storedToken.ObjectMeta.Name != tokenName {
+		return 422, errors.New("Invalid auth token value")
+	}
+	if err := VerifySHA256Hash(storedToken.Token, tokenKey); err != nil {
+		logrus.Errorf("VerifySHA256Hash failed with error: %v", err)
+		return 422, errors.New("Invalid auth token value")
+	}
+	if IsExpired(*storedToken) {
+		return 410, errors.New("must authenticate")
+	}
+	return 200, nil
+}
+
+// ConvertTokenKeyToHash takes a token with an un-hashed key and converts it to a hashed key
+func ConvertTokenKeyToHash(token *v3.Token) error {
+	if token != nil && len(token.Token) > 0 {
+		hashedToken, err := CreateSHA256Hash(token.Token)
+		if err != nil {
+			logrus.Errorf("Failed to generate hash from token: %v", err)
+			return errors.New("failed to generate hash from token")
+		}
+		token.Token = hashedToken
+		if token.Annotations == nil {
+			token.Annotations = map[string]string{}
+		}
+		token.Annotations[TokenHashed] = "true"
+	}
+	return nil
 }

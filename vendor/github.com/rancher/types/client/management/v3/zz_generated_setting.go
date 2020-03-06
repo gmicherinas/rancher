@@ -15,7 +15,8 @@ const (
 	SettingFieldName            = "name"
 	SettingFieldOwnerReferences = "ownerReferences"
 	SettingFieldRemoved         = "removed"
-	SettingFieldUuid            = "uuid"
+	SettingFieldSource          = "source"
+	SettingFieldUUID            = "uuid"
 	SettingFieldValue           = "value"
 )
 
@@ -30,9 +31,11 @@ type Setting struct {
 	Name            string            `json:"name,omitempty" yaml:"name,omitempty"`
 	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	Source          string            `json:"source,omitempty" yaml:"source,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 	Value           string            `json:"value,omitempty" yaml:"value,omitempty"`
 }
+
 type SettingCollection struct {
 	types.Collection
 	Data   []Setting `json:"data,omitempty"`
@@ -45,8 +48,10 @@ type SettingClient struct {
 
 type SettingOperations interface {
 	List(opts *types.ListOpts) (*SettingCollection, error)
+	ListAll(opts *types.ListOpts) (*SettingCollection, error)
 	Create(opts *Setting) (*Setting, error)
 	Update(existing *Setting, updates interface{}) (*Setting, error)
+	Replace(existing *Setting) (*Setting, error)
 	ByID(id string) (*Setting, error)
 	Delete(container *Setting) error
 }
@@ -69,10 +74,34 @@ func (c *SettingClient) Update(existing *Setting, updates interface{}) (*Setting
 	return resp, err
 }
 
+func (c *SettingClient) Replace(obj *Setting) (*Setting, error) {
+	resp := &Setting{}
+	err := c.apiClient.Ops.DoReplace(SettingType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *SettingClient) List(opts *types.ListOpts) (*SettingCollection, error) {
 	resp := &SettingCollection{}
 	err := c.apiClient.Ops.DoList(SettingType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *SettingClient) ListAll(opts *types.ListOpts) (*SettingCollection, error) {
+	resp := &SettingCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

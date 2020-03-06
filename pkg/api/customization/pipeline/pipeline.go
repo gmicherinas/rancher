@@ -1,125 +1,78 @@
 package pipeline
 
 import (
-	"strings"
-
 	"encoding/json"
-	"errors"
 	"fmt"
-	"github.com/rancher/norman/api/access"
-	"github.com/rancher/norman/api/handler"
-	"github.com/rancher/norman/httperror"
-	"github.com/rancher/norman/types"
-	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/rancher/pkg/controllers/user/pipeline/utils"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/client/management/v3"
-	"github.com/robfig/cron"
-	"github.com/sirupsen/logrus"
 	"io/ioutil"
 	"net/http"
+
+	"github.com/pkg/errors"
+	"github.com/rancher/norman/api/access"
+	"github.com/rancher/norman/httperror"
+	"github.com/rancher/norman/types"
+	"github.com/rancher/rancher/pkg/pipeline/providers"
+	"github.com/rancher/rancher/pkg/pipeline/remote"
+	"github.com/rancher/rancher/pkg/pipeline/remote/model"
+	"github.com/rancher/rancher/pkg/pipeline/utils"
+	"github.com/rancher/rancher/pkg/ref"
+	v3 "github.com/rancher/types/apis/project.cattle.io/v3"
+	client "github.com/rancher/types/client/project/v3"
+	"gopkg.in/yaml.v2"
+	"k8s.io/apimachinery/pkg/labels"
+)
+
+const (
+	actionRun        = "run"
+	actionPushConfig = "pushconfig"
+	linkConfigs      = "configs"
+	linkYaml         = "yaml"
+	linkBranches     = "branches"
+	queryBranch      = "branch"
+	queryConfigs     = "configs"
 )
 
 type Handler struct {
-	Pipelines          v3.PipelineInterface
-	PipelineLister     v3.PipelineLister
-	PipelineExecutions v3.PipelineExecutionInterface
+	PipelineLister             v3.PipelineLister
+	PipelineExecutions         v3.PipelineExecutionInterface
+	SourceCodeCredentialLister v3.SourceCodeCredentialLister
+	SourceCodeCredentials      v3.SourceCodeCredentialInterface
 }
 
 func Formatter(apiContext *types.APIContext, resource *types.RawResource) {
-	resource.AddAction(apiContext, "activate")
-	resource.AddAction(apiContext, "deactivate")
-	resource.AddAction(apiContext, "run")
+	resource.AddAction(apiContext, actionRun)
+	resource.AddAction(apiContext, actionPushConfig)
+	resource.Links[linkConfigs] = apiContext.URLBuilder.Link(linkConfigs, resource)
+	resource.Links[linkYaml] = apiContext.URLBuilder.Link(linkYaml, resource)
+	resource.Links[linkBranches] = apiContext.URLBuilder.Link(linkBranches, resource)
 }
 
-func Validator(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}) error {
-	pipelineSpec := v3.PipelineSpec{}
-	if err := convert.ToObj(data, &pipelineSpec); err != nil {
-		return httperror.NewAPIError(httperror.InvalidBodyContent, err.Error())
-	}
-
-	if !validSourceCodeConfig(pipelineSpec) {
-		return httperror.NewAPIError(httperror.InvalidBodyContent,
-			"invalid pipeline definition, expected sourceCode step at the start")
-	}
-
-	if pipelineSpec.TriggerCronExpression != "" {
-		sourceCodeConfig := pipelineSpec.Stages[0].Steps[0].SourceCodeConfig
-		if sourceCodeConfig.BranchCondition == "all" || sourceCodeConfig.BranchCondition == "except" {
-			return httperror.NewAPIError(httperror.InvalidBodyContent,
-				"cron trigger only works for only branch option")
+func (h *Handler) LinkHandler(apiContext *types.APIContext, next types.RequestHandler) error {
+	if apiContext.Link == linkYaml {
+		if apiContext.Method == http.MethodPut {
+			return h.updatePipelineConfigYaml(apiContext)
 		}
-		_, err := cron.ParseStandard(pipelineSpec.TriggerCronExpression)
-		if err != nil {
-			return httperror.NewAPIError(httperror.InvalidBodyContent,
-				"error parse cron trigger")
-		}
+		return h.getPipelineConfigYAML(apiContext)
+	} else if apiContext.Link == linkConfigs {
+		return h.getPipelineConfigJSON(apiContext)
+	} else if apiContext.Link == linkBranches {
+		return h.getBranches(apiContext)
 	}
 
-	return nil
+	return httperror.NewAPIError(httperror.NotFound, "Link not found")
 }
 
-func (h *Handler) CreateHandler(apiContext *types.APIContext, next types.RequestHandler) error {
-	//update hooks endpoint for webhook
-	if err := utils.UpdateEndpoint(apiContext.URLBuilder.Current()); err != nil {
-		return err
-	}
-	return handler.CreateHandler(apiContext, next)
-}
-
-func (h *Handler) UpdateHandler(apiContext *types.APIContext, next types.RequestHandler) error {
-	//update hooks endpoint for webhook
-	if err := utils.UpdateEndpoint(apiContext.URLBuilder.Current()); err != nil {
-		return err
-	}
-	return handler.UpdateHandler(apiContext, next)
-}
 func (h *Handler) ActionHandler(actionName string, action *types.Action, apiContext *types.APIContext) error {
-	logrus.Debugf("do pipeline action:%s", actionName)
-
 	switch actionName {
-	case "activate":
-		return h.changeState(apiContext, "inactive", "active")
-	case "deactivate":
-		return h.changeState(apiContext, "active", "inactive")
-	case "run":
+	case actionRun:
 		return h.run(apiContext)
+	case actionPushConfig:
+		return h.pushConfig(apiContext)
 	}
 	return httperror.NewAPIError(httperror.InvalidAction, "unsupported action")
 }
 
-func (h *Handler) changeState(apiContext *types.APIContext, curState, newState string) error {
-	parts := strings.Split(apiContext.ID, ":")
-	ns := parts[0]
-	name := parts[1]
-
-	pipeline, err := h.PipelineLister.Get(ns, name)
-	if err != nil {
-		return err
-	}
-
-	if pipeline.Status.PipelineState == curState {
-		pipeline.Status.PipelineState = newState
-		if _, err = h.Pipelines.Update(pipeline); err != nil {
-			return err
-		}
-	} else {
-		return fmt.Errorf("Error resource is not %s", curState)
-	}
-
-	data := map[string]interface{}{}
-	if err := access.ByID(apiContext, apiContext.Version, apiContext.Type, apiContext.ID, &data); err != nil {
-		return err
-	}
-
-	apiContext.WriteResponse(http.StatusOK, data)
-	return nil
-}
-
 func (h *Handler) run(apiContext *types.APIContext) error {
-	parts := strings.Split(apiContext.ID, ":")
-	ns := parts[0]
-	name := parts[1]
+	ns, name := ref.Parse(apiContext.ID)
 	pipeline, err := h.PipelineLister.Get(ns, name)
 	if err != nil {
 		return err
@@ -134,27 +87,39 @@ func (h *Handler) run(apiContext *types.APIContext) error {
 			return err
 		}
 	}
-	if !validSourceCodeConfig(pipeline.Spec) {
-		return errors.New("Error invalid pipeline definition")
-	}
+
 	branch := runPipelineInput.Branch
-	branchCondition := pipeline.Spec.Stages[0].Steps[0].SourceCodeConfig.BranchCondition
-	if branchCondition == "except" || branchCondition == "all" {
-		if branch == "" {
-			return httperror.NewAPIError(httperror.InvalidBodyContent, "Error branch is not specified for the pipeline to run")
-		}
-	} else {
-		branch = ""
+	if branch == "" {
+		return httperror.NewAPIError(httperror.InvalidBodyContent, "Error branch is not specified for the pipeline to run")
 	}
 
 	userName := apiContext.Request.Header.Get("Impersonate-User")
-	execution, err := utils.GenerateExecution(h.Pipelines, h.PipelineExecutions, pipeline, utils.TriggerTypeUser, userName, runPipelineInput.Branch)
+	pipelineConfig, err := providers.GetPipelineConfigByBranch(h.SourceCodeCredentials, h.SourceCodeCredentialLister, pipeline, branch)
 	if err != nil {
 		return err
 	}
 
+	if pipelineConfig == nil {
+		return fmt.Errorf("find no pipeline config to run in the branch")
+	}
+
+	info, err := h.getBuildInfoByBranch(pipeline, branch)
+	if err != nil {
+		return err
+	}
+	info.TriggerType = utils.TriggerTypeUser
+	info.TriggerUserName = userName
+	execution, err := utils.GenerateExecution(h.PipelineExecutions, pipeline, pipelineConfig, info)
+	if err != nil {
+		return err
+	}
+
+	if execution == nil {
+		return errors.New("condition is not match, no build is triggered")
+	}
+
 	data := map[string]interface{}{}
-	if err := access.ByID(apiContext, apiContext.Version, client.PipelineExecutionType, ns+":"+execution.Name, &data); err != nil {
+	if err := access.ByID(apiContext, apiContext.Version, client.PipelineExecutionType, ref.Ref(execution), &data); err != nil {
 		return err
 	}
 
@@ -162,11 +127,368 @@ func (h *Handler) run(apiContext *types.APIContext) error {
 	return err
 }
 
-func validSourceCodeConfig(spec v3.PipelineSpec) bool {
-	if len(spec.Stages) < 1 ||
-		len(spec.Stages[0].Steps) < 1 ||
-		spec.Stages[0].Steps[0].SourceCodeConfig == nil {
-		return false
+func (h *Handler) pushConfig(apiContext *types.APIContext) error {
+	ns, name := ref.Parse(apiContext.ID)
+	pipeline, err := h.PipelineLister.Get(ns, name)
+	if err != nil {
+		return err
 	}
-	return true
+
+	pushConfigInput := v3.PushPipelineConfigInput{}
+	requestBytes, err := ioutil.ReadAll(apiContext.Request.Body)
+	if err != nil {
+		return err
+	}
+	if string(requestBytes) != "" {
+		if err := json.Unmarshal(requestBytes, &pushConfigInput); err != nil {
+			return err
+		}
+	}
+
+	//use current user's auth to do the push
+	userName := apiContext.Request.Header.Get("Impersonate-User")
+	creds, err := h.SourceCodeCredentialLister.List(userName, labels.Everything())
+	if err != nil {
+		return err
+	}
+	sourceCodeType := model.GithubType
+	var credential *v3.SourceCodeCredential
+	for _, cred := range creds {
+		if cred.Spec.ProjectName == pipeline.Spec.ProjectName && !cred.Status.Logout {
+			sourceCodeType = cred.Spec.SourceCodeType
+			credential = cred
+			break
+		}
+	}
+
+	_, projID := ref.Parse(pipeline.Spec.ProjectName)
+	scpConfig, err := providers.GetSourceCodeProviderConfig(sourceCodeType, projID)
+	if err != nil {
+		return err
+	}
+	remote, err := remote.New(scpConfig)
+	if err != nil {
+		return err
+	}
+	accessToken, err := utils.EnsureAccessToken(h.SourceCodeCredentials, remote, credential)
+	if err != nil {
+		return err
+	}
+
+	for branch, config := range pushConfigInput.Configs {
+		content, err := utils.PipelineConfigToYaml(&config)
+		if err != nil {
+			return err
+		}
+		if err := remote.SetPipelineFileInRepo(pipeline.Spec.RepositoryURL, branch, accessToken, content); err != nil {
+			if apierr, ok := err.(*httperror.APIError); ok && apierr.Code.Status == http.StatusNotFound {
+				//github returns 404 for unauth request to prevent leakage of private repos
+				return httperror.NewAPIError(httperror.Unauthorized, "current git account is unauthorized for the action")
+			}
+			return err
+		}
+	}
+
+	data := map[string]interface{}{}
+	if err := access.ByID(apiContext, apiContext.Version, apiContext.Type, apiContext.ID, &data); err != nil {
+		return err
+	}
+
+	apiContext.WriteResponse(http.StatusOK, data)
+	return nil
+}
+
+func (h *Handler) getBuildInfoByBranch(pipeline *v3.Pipeline, branch string) (*model.BuildInfo, error) {
+	credentialName := pipeline.Spec.SourceCodeCredentialName
+	repoURL := pipeline.Spec.RepositoryURL
+	var scpConfig interface{}
+	var credential *v3.SourceCodeCredential
+	var err error
+	if credentialName != "" {
+		ns, name := ref.Parse(credentialName)
+		credential, err = h.SourceCodeCredentialLister.Get(ns, name)
+		if err != nil {
+			return nil, err
+		}
+		sourceCodeType := credential.Spec.SourceCodeType
+		_, projID := ref.Parse(pipeline.Spec.ProjectName)
+		scpConfig, err = providers.GetSourceCodeProviderConfig(sourceCodeType, projID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	remote, err := remote.New(scpConfig)
+	if err != nil {
+		return nil, err
+	}
+	accessToken, err := utils.EnsureAccessToken(h.SourceCodeCredentials, remote, credential)
+	if err != nil {
+		return nil, err
+	}
+	info, err := remote.GetHeadInfo(repoURL, branch, accessToken)
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+
+}
+
+func (h *Handler) getBranches(apiContext *types.APIContext) error {
+	ns, name := ref.Parse(apiContext.ID)
+	pipeline, err := h.PipelineLister.Get(ns, name)
+	if err != nil {
+		return err
+	}
+
+	var scpConfig interface{}
+	var cred *v3.SourceCodeCredential
+	if pipeline.Spec.SourceCodeCredentialName != "" {
+		ns, name = ref.Parse(pipeline.Spec.SourceCodeCredentialName)
+		cred, err = h.SourceCodeCredentialLister.Get(ns, name)
+		if err != nil {
+			return err
+		}
+		sourceCodeType := cred.Spec.SourceCodeType
+		_, projID := ref.Parse(pipeline.Spec.ProjectName)
+		scpConfig, err = providers.GetSourceCodeProviderConfig(sourceCodeType, projID)
+		if err != nil {
+			return err
+		}
+	}
+	remote, err := remote.New(scpConfig)
+	if err != nil {
+		return err
+	}
+	accessKey, err := utils.EnsureAccessToken(h.SourceCodeCredentials, remote, cred)
+	if err != nil {
+		return err
+	}
+
+	branches, err := remote.GetBranches(pipeline.Spec.RepositoryURL, accessKey)
+	if err != nil {
+		return err
+	}
+	bytes, err := json.Marshal(branches)
+	if err != nil {
+		return err
+	}
+	apiContext.Response.Write(bytes)
+	return nil
+}
+
+func (h *Handler) getPipelineConfigJSON(apiContext *types.APIContext) error {
+	ns, name := ref.Parse(apiContext.ID)
+	pipeline, err := h.PipelineLister.Get(ns, name)
+	if err != nil {
+		return err
+	}
+	branch := apiContext.Request.URL.Query().Get(queryBranch)
+
+	m, err := h.getPipelineConfigs(pipeline, branch)
+	if err != nil {
+		return err
+	}
+	bytes, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	apiContext.Response.Write(bytes)
+	return nil
+}
+
+func (h *Handler) getPipelineConfigYAML(apiContext *types.APIContext) error {
+	yamlMap := map[string]interface{}{}
+	m := map[string]*v3.PipelineConfig{}
+
+	branch := apiContext.Request.URL.Query().Get(queryBranch)
+	configs := apiContext.Request.URL.Query().Get(queryConfigs)
+	if configs != "" {
+		err := json.Unmarshal([]byte(configs), &m)
+		if err != nil {
+			return err
+		}
+		for b, config := range m {
+			if config == nil {
+				yamlMap[b] = nil
+				continue
+			}
+			content, err := utils.PipelineConfigToYaml(config)
+			if err != nil {
+				return err
+			}
+			yamlMap[b] = string(content)
+		}
+	} else {
+		ns, name := ref.Parse(apiContext.ID)
+		pipeline, err := h.PipelineLister.Get(ns, name)
+		if err != nil {
+			return err
+		}
+		m, err = h.getPipelineConfigs(pipeline, branch)
+		if err != nil {
+			return err
+		}
+	}
+
+	if branch != "" {
+		config := m[branch]
+		if config == nil {
+			return nil
+		}
+		content, err := utils.PipelineConfigToYaml(config)
+		if err != nil {
+			return err
+		}
+		apiContext.Response.Write(content)
+		return nil
+	}
+
+	for b, config := range m {
+		if config == nil {
+			yamlMap[b] = nil
+			continue
+		}
+		content, err := utils.PipelineConfigToYaml(config)
+		if err != nil {
+			return err
+		}
+		yamlMap[b] = string(content)
+	}
+
+	bytes, err := json.Marshal(yamlMap)
+	if err != nil {
+		return err
+	}
+	apiContext.Response.Write(bytes)
+	return nil
+}
+func (h *Handler) updatePipelineConfigYaml(apiContext *types.APIContext) error {
+	branch := apiContext.Request.URL.Query().Get(queryBranch)
+	if branch == "" {
+		return httperror.NewAPIError(httperror.InvalidOption, "Branch is not specified")
+	}
+
+	ns, name := ref.Parse(apiContext.ID)
+	pipeline, err := h.PipelineLister.Get(ns, name)
+	if err != nil {
+		return err
+	}
+
+	content, err := ioutil.ReadAll(apiContext.Request.Body)
+	if err != nil {
+		return err
+	}
+	//check yaml
+	config := &v3.PipelineConfig{}
+	if err := yaml.Unmarshal(content, config); err != nil {
+		return err
+	}
+
+	//use current user's auth to do the push
+	userName := apiContext.Request.Header.Get("Impersonate-User")
+	creds, err := h.SourceCodeCredentialLister.List(userName, labels.Everything())
+	if err != nil {
+		return err
+	}
+	sourceCodeType := model.GithubType
+	var credential *v3.SourceCodeCredential
+	for _, cred := range creds {
+		if cred.Spec.ProjectName == pipeline.Spec.ProjectName && !cred.Status.Logout {
+			sourceCodeType = cred.Spec.SourceCodeType
+			credential = cred
+		}
+	}
+
+	_, projID := ref.Parse(pipeline.Spec.ProjectName)
+	scpConfig, err := providers.GetSourceCodeProviderConfig(sourceCodeType, projID)
+	if err != nil {
+		return err
+	}
+	remote, err := remote.New(scpConfig)
+	if err != nil {
+		return err
+	}
+	accessToken, err := utils.EnsureAccessToken(h.SourceCodeCredentials, remote, credential)
+	if err != nil {
+		return err
+	}
+
+	if err := remote.SetPipelineFileInRepo(pipeline.Spec.RepositoryURL, branch, accessToken, content); err != nil {
+		if apierr, ok := err.(*httperror.APIError); ok && apierr.Code.Status == http.StatusNotFound {
+			//github returns 404 for unauth request to prevent leakage of private repos
+			return httperror.NewAPIError(httperror.Unauthorized, "current git account is unauthorized for the action")
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (h *Handler) getPipelineConfigs(pipeline *v3.Pipeline, branch string) (map[string]*v3.PipelineConfig, error) {
+	var scpConfig interface{}
+	var cred *v3.SourceCodeCredential
+	var err error
+	if pipeline.Spec.SourceCodeCredentialName != "" {
+		ns, name := ref.Parse(pipeline.Spec.SourceCodeCredentialName)
+		cred, err = h.SourceCodeCredentialLister.Get(ns, name)
+		if err != nil {
+			return nil, err
+		}
+		sourceCodeType := cred.Spec.SourceCodeType
+		_, projID := ref.Parse(pipeline.Spec.ProjectName)
+		scpConfig, err = providers.GetSourceCodeProviderConfig(sourceCodeType, projID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	remote, err := remote.New(scpConfig)
+	if err != nil {
+		return nil, err
+	}
+	accessToken, err := utils.EnsureAccessToken(h.SourceCodeCredentials, remote, cred)
+	if err != nil {
+		return nil, err
+	}
+
+	m := map[string]*v3.PipelineConfig{}
+
+	if branch != "" {
+		content, err := remote.GetPipelineFileInRepo(pipeline.Spec.RepositoryURL, branch, accessToken)
+		if err != nil {
+			return nil, err
+		}
+		if content != nil {
+			spec, err := utils.PipelineConfigFromYaml(content)
+			if err != nil {
+				return nil, errors.Wrapf(err, "Error fetching pipeline config in Branch '%s'", branch)
+			}
+			m[branch] = spec
+		} else {
+			m[branch] = nil
+		}
+
+	} else {
+		branches, err := remote.GetBranches(pipeline.Spec.RepositoryURL, accessToken)
+		if err != nil {
+			return nil, err
+		}
+		for _, b := range branches {
+			content, err := remote.GetPipelineFileInRepo(pipeline.Spec.RepositoryURL, b, accessToken)
+			if err != nil {
+				return nil, err
+			}
+			if content != nil {
+				spec, err := utils.PipelineConfigFromYaml(content)
+				if err != nil {
+					return nil, errors.Wrapf(err, "Error fetching pipeline config in Branch '%s'", b)
+				}
+				m[b] = spec
+			} else {
+				m[b] = nil
+			}
+		}
+	}
+
+	return m, nil
 }

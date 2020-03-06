@@ -23,6 +23,12 @@ func NewSchemaStore() types.Store {
 func (s *Store) ByID(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
 	for _, schema := range apiContext.Schemas.SchemasForVersion(*apiContext.Version) {
 		if strings.EqualFold(schema.ID, id) {
+			if schema.Enabled != nil {
+				if !schema.Enabled() {
+					return nil, httperror.NewAPIError(httperror.NotFound, "schema disabled")
+				}
+			}
+
 			schemaData := map[string]interface{}{}
 
 			data, err := json.Marshal(s.modifyForAccessControl(apiContext, *schema))
@@ -38,21 +44,21 @@ func (s *Store) ByID(apiContext *types.APIContext, schema *types.Schema, id stri
 
 func (s *Store) modifyForAccessControl(context *types.APIContext, schema types.Schema) *types.Schema {
 	var resourceMethods []string
-	if slice.ContainsString(schema.ResourceMethods, http.MethodPut) && schema.CanUpdate(context) {
+	if slice.ContainsString(schema.ResourceMethods, http.MethodPut) && schema.CanUpdate(context) == nil {
 		resourceMethods = append(resourceMethods, http.MethodPut)
 	}
-	if slice.ContainsString(schema.ResourceMethods, http.MethodDelete) && schema.CanDelete(context) {
+	if slice.ContainsString(schema.ResourceMethods, http.MethodDelete) && schema.CanDelete(context) == nil {
 		resourceMethods = append(resourceMethods, http.MethodDelete)
 	}
-	if slice.ContainsString(schema.ResourceMethods, http.MethodGet) && schema.CanGet(context) {
+	if slice.ContainsString(schema.ResourceMethods, http.MethodGet) && schema.CanGet(context) == nil {
 		resourceMethods = append(resourceMethods, http.MethodGet)
 	}
 
 	var collectionMethods []string
-	if slice.ContainsString(schema.CollectionMethods, http.MethodPost) && schema.CanCreate(context) {
+	if slice.ContainsString(schema.CollectionMethods, http.MethodPost) && schema.CanCreate(context) == nil {
 		collectionMethods = append(collectionMethods, http.MethodPost)
 	}
-	if slice.ContainsString(schema.CollectionMethods, http.MethodGet) && schema.CanList(context) {
+	if slice.ContainsString(schema.CollectionMethods, http.MethodGet) && schema.CanList(context) == nil {
 		collectionMethods = append(collectionMethods, http.MethodGet)
 	}
 
@@ -78,7 +84,13 @@ func (s *Store) List(apiContext *types.APIContext, schema *types.Schema, opt *ty
 			continue
 		}
 
-		if schema.CanList(apiContext) || schema.CanGet(apiContext) {
+		if schema.Enabled != nil {
+			if !schema.Enabled() {
+				continue
+			}
+		}
+
+		if schema.CanList(apiContext) == nil || schema.CanGet(apiContext) == nil {
 			schemas = s.addSchema(apiContext, schema, schemaMap, schemas, included)
 		}
 	}

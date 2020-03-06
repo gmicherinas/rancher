@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type BasicAuthLifecycle interface {
-	Create(obj *BasicAuth) (*BasicAuth, error)
-	Remove(obj *BasicAuth) (*BasicAuth, error)
-	Updated(obj *BasicAuth) (*BasicAuth, error)
+	Create(obj *BasicAuth) (runtime.Object, error)
+	Remove(obj *BasicAuth) (runtime.Object, error)
+	Updated(obj *BasicAuth) (runtime.Object, error)
 }
 
 type basicAuthLifecycleAdapter struct {
 	lifecycle BasicAuthLifecycle
+}
+
+func (w *basicAuthLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *basicAuthLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *basicAuthLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *basicAuthLifecycleAdapter) Updated(obj runtime.Object) (runtime.Object,
 }
 
 func NewBasicAuthLifecycleAdapter(name string, clusterScoped bool, client BasicAuthInterface, l BasicAuthLifecycle) BasicAuthHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(BasicAuthGroupVersionResource)
+	}
 	adapter := &basicAuthLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *BasicAuth) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *BasicAuth) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

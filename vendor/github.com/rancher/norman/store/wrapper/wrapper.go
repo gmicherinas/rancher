@@ -7,6 +7,10 @@ import (
 )
 
 func Wrap(store types.Store) types.Store {
+	if _, ok := store.(*StoreWrapper); ok {
+		return store
+	}
+
 	return &StoreWrapper{
 		store: store,
 	}
@@ -28,7 +32,7 @@ func (s *StoreWrapper) ByID(apiContext *types.APIContext, schema *types.Schema, 
 
 	return apiContext.FilterObject(&types.QueryOptions{
 		Conditions: apiContext.SubContextAttributeProvider.Query(apiContext, schema),
-	}, data), nil
+	}, schema, data), nil
 }
 
 func (s *StoreWrapper) List(apiContext *types.APIContext, schema *types.Schema, opts *types.QueryOptions) ([]map[string]interface{}, error) {
@@ -38,7 +42,7 @@ func (s *StoreWrapper) List(apiContext *types.APIContext, schema *types.Schema, 
 		return nil, err
 	}
 
-	return apiContext.FilterList(opts, data), nil
+	return apiContext.FilterList(opts, schema, data), nil
 }
 
 func (s *StoreWrapper) Watch(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) (chan map[string]interface{}, error) {
@@ -50,7 +54,7 @@ func (s *StoreWrapper) Watch(apiContext *types.APIContext, schema *types.Schema,
 	return convert.Chan(c, func(data map[string]interface{}) map[string]interface{} {
 		return apiContext.FilterObject(&types.QueryOptions{
 			Conditions: apiContext.SubContextAttributeProvider.Query(apiContext, schema),
-		}, data)
+		}, schema, data)
 	}), nil
 }
 
@@ -83,7 +87,7 @@ func (s *StoreWrapper) Update(apiContext *types.APIContext, schema *types.Schema
 
 	return apiContext.FilterObject(&types.QueryOptions{
 		Conditions: apiContext.SubContextAttributeProvider.Query(apiContext, schema),
-	}, data), nil
+	}, schema, data), nil
 }
 
 func (s *StoreWrapper) Delete(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
@@ -107,7 +111,7 @@ func validateGet(apiContext *types.APIContext, schema *types.Schema, id string) 
 
 	if apiContext.Filter(&types.QueryOptions{
 		Conditions: apiContext.SubContextAttributeProvider.Query(apiContext, schema),
-	}, existing) == nil {
+	}, schema, existing) == nil {
 		return httperror.NewAPIError(httperror.NotFound, "failed to find "+id)
 	}
 

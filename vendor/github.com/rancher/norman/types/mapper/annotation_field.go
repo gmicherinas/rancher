@@ -36,9 +36,9 @@ func (e AnnotationField) FromInternal(data map[string]interface{}) {
 	}
 }
 
-func (e AnnotationField) ToInternal(data map[string]interface{}) {
+func (e AnnotationField) ToInternal(data map[string]interface{}) error {
 	v, ok := data[e.Field]
-	if ok && v != nil {
+	if ok {
 		if e.Object || e.List {
 			if bytes, err := json.Marshal(v); err == nil {
 				v = string(bytes)
@@ -47,6 +47,7 @@ func (e AnnotationField) ToInternal(data map[string]interface{}) {
 		values.PutValue(data, convert.ToString(v), "annotations", "field.cattle.io/"+e.Field)
 	}
 	values.RemoveValue(data, e.Field)
+	return nil
 }
 
 func (e AnnotationField) ModifySchema(schema *types.Schema, schemas *types.Schemas) error {

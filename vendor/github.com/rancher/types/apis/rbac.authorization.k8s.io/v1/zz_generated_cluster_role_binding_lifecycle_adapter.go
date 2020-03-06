@@ -2,18 +2,29 @@ package v1
 
 import (
 	"github.com/rancher/norman/lifecycle"
-	"k8s.io/api/rbac/v1"
+	"github.com/rancher/norman/resource"
+	v1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type ClusterRoleBindingLifecycle interface {
-	Create(obj *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error)
-	Remove(obj *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error)
-	Updated(obj *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error)
+	Create(obj *v1.ClusterRoleBinding) (runtime.Object, error)
+	Remove(obj *v1.ClusterRoleBinding) (runtime.Object, error)
+	Updated(obj *v1.ClusterRoleBinding) (runtime.Object, error)
 }
 
 type clusterRoleBindingLifecycleAdapter struct {
 	lifecycle ClusterRoleBindingLifecycle
+}
+
+func (w *clusterRoleBindingLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *clusterRoleBindingLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *clusterRoleBindingLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -41,12 +52,16 @@ func (w *clusterRoleBindingLifecycleAdapter) Updated(obj runtime.Object) (runtim
 }
 
 func NewClusterRoleBindingLifecycleAdapter(name string, clusterScoped bool, client ClusterRoleBindingInterface, l ClusterRoleBindingLifecycle) ClusterRoleBindingHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(ClusterRoleBindingGroupVersionResource)
+	}
 	adapter := &clusterRoleBindingLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *v1.ClusterRoleBinding) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *v1.ClusterRoleBinding) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

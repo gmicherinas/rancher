@@ -10,7 +10,7 @@ import (
 
 var (
 	defaultLimit = int64(1000)
-	maxLimit     = int64(3000)
+	maxLimit     = int64(10000)
 )
 
 func QueryOptions(apiContext *types.APIContext, schema *types.Schema) types.QueryOptions {
@@ -48,6 +48,10 @@ func parseSort(schema *types.Schema, apiContext *types.APIContext) types.Sort {
 }
 
 func parsePagination(apiContext *types.APIContext) *types.Pagination {
+	if apiContext.Pagination != nil {
+		return apiContext.Pagination
+	}
+
 	q := apiContext.Query
 	limit := q.Get("limit")
 	marker := q.Get("marker")
@@ -63,7 +67,7 @@ func parsePagination(apiContext *types.APIContext) *types.Pagination {
 			return result
 		}
 
-		if limitInt > maxLimit {
+		if limitInt > maxLimit || limitInt == -1 {
 			result.Limit = &maxLimit
 		} else if limitInt >= 0 {
 			result.Limit = &limitInt

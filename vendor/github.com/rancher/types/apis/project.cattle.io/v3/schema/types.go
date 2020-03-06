@@ -3,7 +3,7 @@ package schema
 import (
 	"github.com/rancher/norman/types"
 	m "github.com/rancher/norman/types/mapper"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -44,17 +44,6 @@ type EnvironmentFrom struct {
 	Prefix     string
 	Optional   bool
 	TargetKey  string
-}
-
-type Resources struct {
-	CPU       *ResourceRequest
-	Memory    *ResourceRequest
-	NvidiaGPU *ResourceRequest
-}
-
-type ResourceRequest struct {
-	Request string
-	Limit   string
 }
 
 type Scheduling struct {

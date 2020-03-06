@@ -11,7 +11,7 @@ import (
 )
 
 // NewClient creates a grpc client for a driver plugin
-func NewClient(driverName string, addr string) (Driver, error) {
+func NewClient(driverName string, addr string) (CloseableDriver, error) {
 	conn, err := grpc.Dial(addr, grpc.WithInsecure())
 	if err != nil {
 		return nil, err
@@ -20,6 +20,7 @@ func NewClient(driverName string, addr string) (Driver, error) {
 	return &grpcClient{
 		client:     c,
 		driverName: driverName,
+		conn:       conn,
 	}, nil
 }
 
@@ -27,12 +28,20 @@ func NewClient(driverName string, addr string) (Driver, error) {
 type grpcClient struct {
 	client     DriverClient
 	driverName string
+	conn       *grpc.ClientConn
 }
 
 // Create call grpc create
-func (rpc *grpcClient) Create(ctx context.Context, opts *DriverOptions) (*ClusterInfo, error) {
-	o, err := rpc.client.Create(ctx, opts)
-	return o, handlErr(err)
+func (rpc *grpcClient) Create(ctx context.Context, opts *DriverOptions, clusterInfo *ClusterInfo) (*ClusterInfo, error) {
+	o, err := rpc.client.Create(ctx, &CreateRequest{
+		DriverOptions: opts,
+		ClusterInfo:   clusterInfo,
+	})
+	err = handlErr(err)
+	if err == nil && o.CreateError != "" {
+		err = errors.New(o.CreateError)
+	}
+	return o, err
 }
 
 // Update call grpc update
@@ -89,6 +98,35 @@ func (rpc *grpcClient) SetClusterSize(ctx context.Context, info *ClusterInfo, co
 
 func (rpc *grpcClient) GetCapabilities(ctx context.Context) (*Capabilities, error) {
 	return rpc.client.GetCapabilities(ctx, &Empty{})
+}
+
+func (rpc *grpcClient) GetK8SCapabilities(ctx context.Context, opts *DriverOptions) (*K8SCapabilities, error) {
+	capabilities, err := rpc.client.GetK8SCapabilities(ctx, opts)
+	return capabilities, handlErr(err)
+}
+
+func (rpc *grpcClient) Close() error {
+	return rpc.conn.Close()
+}
+
+func (rpc *grpcClient) ETCDSave(ctx context.Context, clusterInfo *ClusterInfo, opts *DriverOptions, snapshotName string) error {
+	_, err := rpc.client.ETCDSave(ctx, &SaveETCDSnapshotRequest{Info: clusterInfo, SnapshotName: snapshotName, DriverOptions: opts})
+	return handlErr(err)
+}
+
+func (rpc *grpcClient) ETCDRestore(ctx context.Context, clusterInfo *ClusterInfo, opts *DriverOptions, snapshotName string) (*ClusterInfo, error) {
+	o, err := rpc.client.ETCDRestore(ctx, &RestoreETCDSnapshotRequest{Info: clusterInfo, SnapshotName: snapshotName, DriverOptions: opts})
+	return o, handlErr(err)
+}
+
+func (rpc *grpcClient) ETCDRemoveSnapshot(ctx context.Context, clusterInfo *ClusterInfo, opts *DriverOptions, snapshotName string) error {
+	_, err := rpc.client.ETCDRemoveSnapshot(ctx, &RemoveETCDSnapshotRequest{Info: clusterInfo, SnapshotName: snapshotName, DriverOptions: opts})
+	return handlErr(err)
+}
+
+func (rpc *grpcClient) RemoveLegacyServiceAccount(ctx context.Context, info *ClusterInfo) error {
+	_, err := rpc.client.RemoveLegacyServiceAccount(ctx, info)
+	return handlErr(err)
 }
 
 func handlErr(err error) error {

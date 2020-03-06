@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type ClusterRoleTemplateBindingLifecycle interface {
-	Create(obj *ClusterRoleTemplateBinding) (*ClusterRoleTemplateBinding, error)
-	Remove(obj *ClusterRoleTemplateBinding) (*ClusterRoleTemplateBinding, error)
-	Updated(obj *ClusterRoleTemplateBinding) (*ClusterRoleTemplateBinding, error)
+	Create(obj *ClusterRoleTemplateBinding) (runtime.Object, error)
+	Remove(obj *ClusterRoleTemplateBinding) (runtime.Object, error)
+	Updated(obj *ClusterRoleTemplateBinding) (runtime.Object, error)
 }
 
 type clusterRoleTemplateBindingLifecycleAdapter struct {
 	lifecycle ClusterRoleTemplateBindingLifecycle
+}
+
+func (w *clusterRoleTemplateBindingLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *clusterRoleTemplateBindingLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *clusterRoleTemplateBindingLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *clusterRoleTemplateBindingLifecycleAdapter) Updated(obj runtime.Object)
 }
 
 func NewClusterRoleTemplateBindingLifecycleAdapter(name string, clusterScoped bool, client ClusterRoleTemplateBindingInterface, l ClusterRoleTemplateBindingLifecycle) ClusterRoleTemplateBindingHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(ClusterRoleTemplateBindingGroupVersionResource)
+	}
 	adapter := &clusterRoleTemplateBindingLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *ClusterRoleTemplateBinding) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *ClusterRoleTemplateBinding) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

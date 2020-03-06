@@ -2,11 +2,15 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
+
+	"github.com/rancher/rke/metadata"
 
 	"github.com/rancher/rke/cluster"
 	"github.com/rancher/rke/pki"
@@ -40,6 +44,22 @@ func ConfigCommand() cli.Command {
 			cli.BoolFlag{
 				Name:  "print,p",
 				Usage: "Print configuration",
+			},
+			cli.BoolFlag{
+				Name:  "system-images,s",
+				Usage: "Generate the default system images",
+			},
+			cli.BoolFlag{
+				Name:  "list-version,l",
+				Usage: "List the default kubernetes version",
+			},
+			cli.BoolFlag{
+				Name:  "all,a",
+				Usage: "Used with -s and -l, get all available versions",
+			},
+			cli.StringFlag{
+				Name:  "version",
+				Usage: "Generate the default system images for specific k8s versions",
 			},
 		},
 	}
@@ -81,24 +101,44 @@ func writeConfig(cluster *v3.RancherKubernetesEngineConfig, configFile string, p
 }
 
 func clusterConfig(ctx *cli.Context) error {
-	configFile := ctx.String("name")
-	print := ctx.Bool("print")
-	cluster := v3.RancherKubernetesEngineConfig{}
+	if metadata.K8sVersionToRKESystemImages == nil {
+		err := metadata.InitMetadata(context.Background())
+		if err != nil {
+			return err
+		}
+	}
 
-	// Get cluster config from user
+	if ctx.Bool("system-images") {
+		return generateSystemImagesList(ctx.String("version"), ctx.Bool("all"))
+	}
+
+	if ctx.Bool("list-version") {
+		if metadata.K8sVersionToRKESystemImages == nil {
+			err := metadata.InitMetadata(context.Background())
+			if err != nil {
+				return err
+			}
+		}
+		return generateK8sVersionList(ctx.Bool("all"))
+	}
+
+	configFile := ctx.String("name")
+	engineConfig := v3.RancherKubernetesEngineConfig{}
+
+	// Get engineConfig config from user
 	reader := bufio.NewReader(os.Stdin)
 
 	// Generate empty configuration file
 	if ctx.Bool("empty") {
-		cluster.Nodes = make([]v3.RKEConfigNode, 1)
-		return writeConfig(&cluster, configFile, print)
+		engineConfig.Nodes = make([]v3.RKEConfigNode, 1)
+		return writeConfig(&engineConfig, configFile, ctx.Bool("print"))
 	}
 
 	sshKeyPath, err := getConfig(reader, "Cluster Level SSH Private Key Path", "~/.ssh/id_rsa")
 	if err != nil {
 		return err
 	}
-	cluster.SSHKeyPath = sshKeyPath
+	engineConfig.SSHKeyPath = sshKeyPath
 
 	// Get number of hosts
 	numberOfHostsString, err := getConfig(reader, "Number of Hosts", "1")
@@ -111,13 +151,13 @@ func clusterConfig(ctx *cli.Context) error {
 	}
 
 	// Get Hosts config
-	cluster.Nodes = make([]v3.RKEConfigNode, 0)
+	engineConfig.Nodes = make([]v3.RKEConfigNode, 0)
 	for i := 0; i < numberOfHostsInt; i++ {
-		hostCfg, err := getHostConfig(reader, i, cluster.SSHKeyPath)
+		hostCfg, err := getHostConfig(reader, i, engineConfig.SSHKeyPath)
 		if err != nil {
 			return err
 		}
-		cluster.Nodes = append(cluster.Nodes, *hostCfg)
+		engineConfig.Nodes = append(engineConfig.Nodes, *hostCfg)
 	}
 
 	// Get Network config
@@ -125,30 +165,47 @@ func clusterConfig(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	cluster.Network = *networkConfig
+	engineConfig.Network = *networkConfig
 
 	// Get Authentication Config
 	authnConfig, err := getAuthnConfig(reader)
 	if err != nil {
 		return err
 	}
-	cluster.Authentication = *authnConfig
+	engineConfig.Authentication = *authnConfig
 
 	// Get Authorization config
 	authzConfig, err := getAuthzConfig(reader)
 	if err != nil {
 		return err
 	}
-	cluster.Authorization = *authzConfig
+	engineConfig.Authorization = *authzConfig
+
+	// Get k8s/system images
+	systemImages, err := getSystemImagesConfig(reader)
+	if err != nil {
+		return err
+	}
+	engineConfig.SystemImages = *systemImages
 
 	// Get Services Config
 	serviceConfig, err := getServiceConfig(reader)
 	if err != nil {
 		return err
 	}
-	cluster.Services = *serviceConfig
+	engineConfig.Services = *serviceConfig
 
-	return writeConfig(&cluster, configFile, print)
+	//Get addon manifests
+	addonsInclude, err := getAddonManifests(reader)
+	if err != nil {
+		return err
+	}
+
+	if len(addonsInclude) > 0 {
+		engineConfig.AddonsInclude = append(engineConfig.AddonsInclude, addonsInclude...)
+	}
+
+	return writeConfig(&engineConfig, configFile, ctx.Bool("print"))
 }
 
 func getHostConfig(reader *bufio.Reader, index int, clusterSSHKeyPath string) (*v3.RKEConfigNode, error) {
@@ -192,7 +249,7 @@ func getHostConfig(reader *bufio.Reader, index int, clusterSSHKeyPath string) (*
 	}
 	host.User = sshUser
 
-	isControlHost, err := getConfig(reader, fmt.Sprintf("Is host (%s) a control host (y/n)?", address), "y")
+	isControlHost, err := getConfig(reader, fmt.Sprintf("Is host (%s) a Control Plane host (y/n)?", address), "y")
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +257,7 @@ func getHostConfig(reader *bufio.Reader, index int, clusterSSHKeyPath string) (*
 		host.Role = append(host.Role, services.ControlRole)
 	}
 
-	isWorkerHost, err := getConfig(reader, fmt.Sprintf("Is host (%s) a worker host (y/n)?", address), "n")
+	isWorkerHost, err := getConfig(reader, fmt.Sprintf("Is host (%s) a Worker host (y/n)?", address), "n")
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +265,7 @@ func getHostConfig(reader *bufio.Reader, index int, clusterSSHKeyPath string) (*
 		host.Role = append(host.Role, services.WorkerRole)
 	}
 
-	isEtcdHost, err := getConfig(reader, fmt.Sprintf("Is host (%s) an Etcd host (y/n)?", address), "n")
+	isEtcdHost, err := getConfig(reader, fmt.Sprintf("Is host (%s) an etcd host (y/n)?", address), "n")
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +293,22 @@ func getHostConfig(reader *bufio.Reader, index int, clusterSSHKeyPath string) (*
 	return &host, nil
 }
 
+func getSystemImagesConfig(reader *bufio.Reader) (*v3.RKESystemImages, error) {
+	imageDefaults := metadata.K8sVersionToRKESystemImages[metadata.DefaultK8sVersion]
+
+	kubeImage, err := getConfig(reader, "Kubernetes Docker image", imageDefaults.Kubernetes)
+	if err != nil {
+		return nil, err
+	}
+
+	systemImages, ok := metadata.K8sVersionToRKESystemImages[kubeImage]
+	if ok {
+		return &systemImages, nil
+	}
+	imageDefaults.Kubernetes = kubeImage
+	return &imageDefaults, nil
+}
+
 func getServiceConfig(reader *bufio.Reader) (*v3.RKEConfigServices, error) {
 	servicesConfig := v3.RKEConfigServices{}
 	servicesConfig.Etcd = v3.ETCDService{}
@@ -244,24 +317,6 @@ func getServiceConfig(reader *bufio.Reader) (*v3.RKEConfigServices, error) {
 	servicesConfig.Scheduler = v3.SchedulerService{}
 	servicesConfig.Kubelet = v3.KubeletService{}
 	servicesConfig.Kubeproxy = v3.KubeproxyService{}
-
-	imageDefaults := v3.K8sVersionToRKESystemImages[cluster.DefaultK8sVersion]
-
-	etcdImage, err := getConfig(reader, "Etcd Docker Image", imageDefaults.Etcd)
-	if err != nil {
-		return nil, err
-	}
-	servicesConfig.Etcd.Image = etcdImage
-
-	kubeImage, err := getConfig(reader, "Kubernetes Docker image", imageDefaults.Kubernetes)
-	if err != nil {
-		return nil, err
-	}
-	servicesConfig.KubeAPI.Image = kubeImage
-	servicesConfig.KubeController.Image = kubeImage
-	servicesConfig.Scheduler.Image = kubeImage
-	servicesConfig.Kubelet.Image = kubeImage
-	servicesConfig.Kubeproxy.Image = kubeImage
 
 	clusterDomain, err := getConfig(reader, "Cluster domain", cluster.DefaultClusterDomain)
 	if err != nil {
@@ -298,11 +353,6 @@ func getServiceConfig(reader *bufio.Reader) (*v3.RKEConfigServices, error) {
 	}
 	servicesConfig.Kubelet.ClusterDNSServer = clusterDNSServiceIP
 
-	infraPodImage, err := getConfig(reader, "Infra Container image", imageDefaults.PodInfraContainer)
-	if err != nil {
-		return nil, err
-	}
-	servicesConfig.Kubelet.InfraContainerImage = infraPodImage
 	return &servicesConfig, nil
 }
 
@@ -336,4 +386,124 @@ func getNetworkConfig(reader *bufio.Reader) (*v3.NetworkConfig, error) {
 	}
 	networkConfig.Plugin = networkPlugin
 	return &networkConfig, nil
+}
+
+func getAddonManifests(reader *bufio.Reader) ([]string, error) {
+	var addonSlice []string
+	var resume = true
+
+	includeAddons, err := getConfig(reader, "Add addon manifest URLs or YAML files", "no")
+
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.ContainsAny(includeAddons, "Yes YES Y yes y") {
+		for resume {
+			addonPath, err := getConfig(reader, "Enter the Path or URL for the manifest", "")
+			if err != nil {
+				return nil, err
+			}
+
+			addonSlice = append(addonSlice, addonPath)
+
+			cont, err := getConfig(reader, "Add another addon", "no")
+			if err != nil {
+				return nil, err
+			}
+
+			if strings.ContainsAny(cont, "Yes y Y yes YES") {
+				resume = true
+			} else {
+				resume = false
+			}
+
+		}
+	}
+
+	return addonSlice, nil
+}
+
+func generateK8sVersionList(all bool) error {
+	if !all {
+		fmt.Println(metadata.DefaultK8sVersion)
+		return nil
+	}
+
+	for _, version := range metadata.K8sVersionsCurrent {
+		if _, ok := metadata.K8sBadVersions[version]; !ok {
+			fmt.Println(version)
+		}
+	}
+
+	return nil
+}
+
+func generateSystemImagesList(version string, all bool) error {
+	allVersions := []string{}
+	currentVersionImages := make(map[string]v3.RKESystemImages)
+	for _, version := range metadata.K8sVersionsCurrent {
+		if _, ok := metadata.K8sBadVersions[version]; !ok {
+			allVersions = append(allVersions, version)
+			currentVersionImages[version] = metadata.K8sVersionToRKESystemImages[version]
+		}
+	}
+	if all {
+		for version, rkeSystemImages := range currentVersionImages {
+			logrus.Infof("Generating images list for version [%s]:", version)
+			uniqueImages := getUniqueSystemImageList(rkeSystemImages)
+			for _, image := range uniqueImages {
+				if image == "" {
+					continue
+				}
+				fmt.Printf("%s\n", image)
+			}
+		}
+		return nil
+	}
+	if len(version) == 0 {
+		version = metadata.DefaultK8sVersion
+	}
+	rkeSystemImages := metadata.K8sVersionToRKESystemImages[version]
+	if _, ok := metadata.K8sBadVersions[version]; ok {
+		return fmt.Errorf("k8s version is not supported, supported versions are: %v", allVersions)
+	}
+	if rkeSystemImages == (v3.RKESystemImages{}) {
+		return fmt.Errorf("k8s version is not supported, supported versions are: %v", allVersions)
+	}
+	logrus.Infof("Generating images list for version [%s]:", version)
+	uniqueImages := getUniqueSystemImageList(rkeSystemImages)
+	for _, image := range uniqueImages {
+		if image == "" {
+			continue
+		}
+		fmt.Printf("%s\n", image)
+	}
+	return nil
+}
+
+func getUniqueSystemImageList(rkeSystemImages v3.RKESystemImages) []string {
+	// windows image not relevant for rke cli
+	rkeSystemImages.WindowsPodInfraContainer = ""
+	imagesReflect := reflect.ValueOf(rkeSystemImages)
+	images := make([]string, imagesReflect.NumField())
+	for i := 0; i < imagesReflect.NumField(); i++ {
+		images[i] = imagesReflect.Field(i).Interface().(string)
+	}
+	return getUniqueSlice(images)
+}
+
+func getUniqueSlice(slice []string) []string {
+	encountered := map[string]bool{}
+	unqiue := []string{}
+
+	for i := range slice {
+		if encountered[slice[i]] {
+			continue
+		} else {
+			encountered[slice[i]] = true
+			unqiue = append(unqiue, slice[i])
+		}
+	}
+	return unqiue
 }

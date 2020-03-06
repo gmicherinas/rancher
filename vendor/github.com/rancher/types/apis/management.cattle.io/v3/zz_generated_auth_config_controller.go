@@ -2,14 +2,17 @@ package v3
 
 import (
 	"context"
+	"time"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
@@ -26,15 +29,34 @@ var (
 		Namespaced:   false,
 		Kind:         AuthConfigGroupVersionKind.Kind,
 	}
+
+	AuthConfigGroupVersionResource = schema.GroupVersionResource{
+		Group:    GroupName,
+		Version:  Version,
+		Resource: "authconfigs",
+	}
 )
+
+func init() {
+	resource.Put(AuthConfigGroupVersionResource)
+}
+
+func NewAuthConfig(namespace, name string, obj AuthConfig) *AuthConfig {
+	obj.APIVersion, obj.Kind = AuthConfigGroupVersionKind.ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
 
 type AuthConfigList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []AuthConfig
+	Items           []AuthConfig `json:"items"`
 }
 
-type AuthConfigHandlerFunc func(key string, obj *AuthConfig) error
+type AuthConfigHandlerFunc func(key string, obj *AuthConfig) (runtime.Object, error)
+
+type AuthConfigChangeHandlerFunc func(obj *AuthConfig) (runtime.Object, error)
 
 type AuthConfigLister interface {
 	List(namespace string, selector labels.Selector) (ret []*AuthConfig, err error)
@@ -42,17 +64,21 @@ type AuthConfigLister interface {
 }
 
 type AuthConfigController interface {
+	Generic() controller.GenericController
 	Informer() cache.SharedIndexInformer
 	Lister() AuthConfigLister
-	AddHandler(name string, handler AuthConfigHandlerFunc)
-	AddClusterScopedHandler(name, clusterName string, handler AuthConfigHandlerFunc)
+	AddHandler(ctx context.Context, name string, handler AuthConfigHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync AuthConfigHandlerFunc)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, handler AuthConfigHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, handler AuthConfigHandlerFunc)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, after time.Duration)
 	Sync(ctx context.Context) error
 	Start(ctx context.Context, threadiness int) error
 }
 
 type AuthConfigInterface interface {
-	ObjectClient() *clientbase.ObjectClient
+	ObjectClient() *objectclient.ObjectClient
 	Create(*AuthConfig) (*AuthConfig, error)
 	GetNamespaced(namespace, name string, opts metav1.GetOptions) (*AuthConfig, error)
 	Get(name string, opts metav1.GetOptions) (*AuthConfig, error)
@@ -60,13 +86,18 @@ type AuthConfigInterface interface {
 	Delete(name string, options *metav1.DeleteOptions) error
 	DeleteNamespaced(namespace, name string, options *metav1.DeleteOptions) error
 	List(opts metav1.ListOptions) (*AuthConfigList, error)
+	ListNamespaced(namespace string, opts metav1.ListOptions) (*AuthConfigList, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts metav1.ListOptions) error
 	Controller() AuthConfigController
-	AddHandler(name string, sync AuthConfigHandlerFunc)
-	AddLifecycle(name string, lifecycle AuthConfigLifecycle)
-	AddClusterScopedHandler(name, clusterName string, sync AuthConfigHandlerFunc)
-	AddClusterScopedLifecycle(name, clusterName string, lifecycle AuthConfigLifecycle)
+	AddHandler(ctx context.Context, name string, sync AuthConfigHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync AuthConfigHandlerFunc)
+	AddLifecycle(ctx context.Context, name string, lifecycle AuthConfigLifecycle)
+	AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle AuthConfigLifecycle)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync AuthConfigHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync AuthConfigHandlerFunc)
+	AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle AuthConfigLifecycle)
+	AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle AuthConfigLifecycle)
 }
 
 type authConfigLister struct {
@@ -95,7 +126,7 @@ func (l *authConfigLister) Get(namespace, name string) (*AuthConfig, error) {
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    AuthConfigGroupVersionKind.Group,
 			Resource: "authConfig",
-		}, name)
+		}, key)
 	}
 	return obj.(*AuthConfig), nil
 }
@@ -104,40 +135,65 @@ type authConfigController struct {
 	controller.GenericController
 }
 
+func (c *authConfigController) Generic() controller.GenericController {
+	return c.GenericController
+}
+
 func (c *authConfigController) Lister() AuthConfigLister {
 	return &authConfigLister{
 		controller: c,
 	}
 }
 
-func (c *authConfigController) AddHandler(name string, handler AuthConfigHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *authConfigController) AddHandler(ctx context.Context, name string, handler AuthConfigHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*AuthConfig); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
-		return handler(key, obj.(*AuthConfig))
 	})
 }
 
-func (c *authConfigController) AddClusterScopedHandler(name, cluster string, handler AuthConfigHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *authConfigController) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, handler AuthConfigHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*AuthConfig); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		if !controller.ObjectInCluster(cluster, obj) {
-			return nil
+func (c *authConfigController) AddClusterScopedHandler(ctx context.Context, name, cluster string, handler AuthConfigHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*AuthConfig); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		return handler(key, obj.(*AuthConfig))
+func (c *authConfigController) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, cluster string, handler AuthConfigHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*AuthConfig); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
+		}
 	})
 }
 
@@ -177,11 +233,11 @@ func (s *authConfigClient) Controller() AuthConfigController {
 type authConfigClient struct {
 	client       *Client
 	ns           string
-	objectClient *clientbase.ObjectClient
+	objectClient *objectclient.ObjectClient
 	controller   AuthConfigController
 }
 
-func (s *authConfigClient) ObjectClient() *clientbase.ObjectClient {
+func (s *authConfigClient) ObjectClient() *objectclient.ObjectClient {
 	return s.objectClient
 }
 
@@ -218,13 +274,18 @@ func (s *authConfigClient) List(opts metav1.ListOptions) (*AuthConfigList, error
 	return obj.(*AuthConfigList), err
 }
 
+func (s *authConfigClient) ListNamespaced(namespace string, opts metav1.ListOptions) (*AuthConfigList, error) {
+	obj, err := s.objectClient.ListNamespaced(namespace, opts)
+	return obj.(*AuthConfigList), err
+}
+
 func (s *authConfigClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	return s.objectClient.Watch(opts)
 }
 
 // Patch applies the patch and returns the patched deployment.
-func (s *authConfigClient) Patch(o *AuthConfig, data []byte, subresources ...string) (*AuthConfig, error) {
-	obj, err := s.objectClient.Patch(o.Name, o, data, subresources...)
+func (s *authConfigClient) Patch(o *AuthConfig, patchType types.PatchType, data []byte, subresources ...string) (*AuthConfig, error) {
+	obj, err := s.objectClient.Patch(o.Name, o, patchType, data, subresources...)
 	return obj.(*AuthConfig), err
 }
 
@@ -232,20 +293,38 @@ func (s *authConfigClient) DeleteCollection(deleteOpts *metav1.DeleteOptions, li
 	return s.objectClient.DeleteCollection(deleteOpts, listOpts)
 }
 
-func (s *authConfigClient) AddHandler(name string, sync AuthConfigHandlerFunc) {
-	s.Controller().AddHandler(name, sync)
+func (s *authConfigClient) AddHandler(ctx context.Context, name string, sync AuthConfigHandlerFunc) {
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *authConfigClient) AddLifecycle(name string, lifecycle AuthConfigLifecycle) {
+func (s *authConfigClient) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync AuthConfigHandlerFunc) {
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
+}
+
+func (s *authConfigClient) AddLifecycle(ctx context.Context, name string, lifecycle AuthConfigLifecycle) {
 	sync := NewAuthConfigLifecycleAdapter(name, false, s, lifecycle)
-	s.AddHandler(name, sync)
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *authConfigClient) AddClusterScopedHandler(name, clusterName string, sync AuthConfigHandlerFunc) {
-	s.Controller().AddClusterScopedHandler(name, clusterName, sync)
+func (s *authConfigClient) AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle AuthConfigLifecycle) {
+	sync := NewAuthConfigLifecycleAdapter(name, false, s, lifecycle)
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
 }
 
-func (s *authConfigClient) AddClusterScopedLifecycle(name, clusterName string, lifecycle AuthConfigLifecycle) {
+func (s *authConfigClient) AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync AuthConfigHandlerFunc) {
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *authConfigClient) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync AuthConfigHandlerFunc) {
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
+}
+
+func (s *authConfigClient) AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle AuthConfigLifecycle) {
 	sync := NewAuthConfigLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
-	s.AddClusterScopedHandler(name, clusterName, sync)
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *authConfigClient) AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle AuthConfigLifecycle) {
+	sync := NewAuthConfigLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
 }

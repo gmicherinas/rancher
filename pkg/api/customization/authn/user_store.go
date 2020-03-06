@@ -3,14 +3,17 @@ package authn
 import (
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/store/transform"
 	"github.com/rancher/norman/types"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/client/management/v3"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
+	client "github.com/rancher/types/client/management/v3"
 	"github.com/rancher/types/config"
+	"github.com/rancher/types/user"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"k8s.io/client-go/tools/cache"
 )
@@ -21,6 +24,7 @@ type userStore struct {
 	types.Store
 	mu          sync.Mutex
 	userIndexer cache.Indexer
+	userManager user.Manager
 }
 
 func SetUserStore(schema *types.Schema, mgmt *config.ScaledContext) {
@@ -34,11 +38,12 @@ func SetUserStore(schema *types.Schema, mgmt *config.ScaledContext) {
 		Store:       schema.Store,
 		mu:          sync.Mutex{},
 		userIndexer: userInformer.GetIndexer(),
+		userManager: mgmt.UserManager,
 	}
 
 	t := &transform.Store{
 		Store: store,
-		Transformer: func(apiContext *types.APIContext, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
+		Transformer: func(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
 			// filter system users out of the api
 			if princIds, ok := data[client.UserFieldPrincipalIDs].([]interface{}); ok {
 				for _, p := range princIds {
@@ -84,7 +89,7 @@ func hashPassword(data map[string]interface{}) error {
 	if !ok {
 		return errors.New("password not a string")
 	}
-	hashed, err := hashPasswordString(pass)
+	hashed, err := HashPasswordString(pass)
 	if err != nil {
 		return err
 	}
@@ -93,7 +98,7 @@ func hashPassword(data map[string]interface{}) error {
 	return nil
 }
 
-func hashPasswordString(password string) (string, error) {
+func HashPasswordString(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return "", errors.Wrap(err, "problem encrypting password")
@@ -111,16 +116,47 @@ func (s *userStore) Create(apiContext *types.APIContext, schema *types.Schema, d
 		return nil, err
 	}
 
-	if id, ok := created[types.ResourceFieldID].(string); ok {
-		var principalIDs []interface{}
-		if pids, ok := created[client.UserFieldPrincipalIDs].([]interface{}); ok {
-			principalIDs = pids
+Tries:
+	for x := 0; x < 3; x++ {
+		if id, ok := created[types.ResourceFieldID].(string); ok {
+			time.Sleep(time.Duration((x+1)*100) * time.Millisecond)
+
+			created, err = s.ByID(apiContext, schema, id)
+			if err != nil {
+				logrus.Warnf("error while getting user: %v", err)
+				continue
+			}
+
+			var principalIDs []interface{}
+			if pids, ok := created[client.UserFieldPrincipalIDs].([]interface{}); ok {
+				principalIDs = pids
+			}
+
+			for _, pid := range principalIDs {
+				if pidString, ok := pid.(string); ok {
+					if strings.HasPrefix(pidString, "local://") {
+						break Tries
+					}
+				}
+			}
+
+			created[client.UserFieldPrincipalIDs] = append(principalIDs, "local://"+id)
+			created, err = s.Update(apiContext, schema, created, id)
+			if err != nil {
+				if httperror.IsConflict(err) {
+					continue
+				}
+
+				logrus.Warnf("error while updating user: %v", err)
+				break
+			}
+			break
 		}
-		created[client.UserFieldPrincipalIDs] = append(principalIDs, "local://"+id)
-		return s.Update(apiContext, schema, created, id)
 	}
 
-	return created, err
+	delete(created, client.UserFieldPassword)
+
+	return created, nil
 }
 
 func (s *userStore) create(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}) (map[string]interface{}, error) {
@@ -141,4 +177,44 @@ func (s *userStore) create(apiContext *types.APIContext, schema *types.Schema, d
 	}
 
 	return s.Store.Create(apiContext, schema, data)
+}
+
+func (s *userStore) Update(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, id string) (map[string]interface{}, error) {
+	currentUser, err := getUser(apiContext)
+	if err != nil {
+		return nil, err
+	}
+
+	willBeInactive := false
+	if val, ok := data[client.UserFieldEnabled].(bool); ok {
+		willBeInactive = !val
+	}
+
+	if currentUser == id && willBeInactive {
+		return nil, httperror.NewAPIError(httperror.InvalidAction, "You cannot deactivate yourself")
+	}
+
+	return s.Store.Update(apiContext, schema, data, id)
+}
+
+func (s *userStore) Delete(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
+	currentUser, err := getUser(apiContext)
+	if err != nil {
+		return nil, err
+	}
+
+	if currentUser == id {
+		return nil, httperror.NewAPIError(httperror.InvalidAction, "You cannot delete yourself")
+	}
+
+	return s.Store.Delete(apiContext, schema, id)
+}
+
+func getUser(apiContext *types.APIContext) (string, error) {
+	user := apiContext.Request.Header.Get("Impersonate-User")
+	if user == "" {
+		return "", httperror.NewAPIError(httperror.ServerError, "There was an error authorizing the user")
+	}
+
+	return user, nil
 }

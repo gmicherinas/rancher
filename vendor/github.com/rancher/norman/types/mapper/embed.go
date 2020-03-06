@@ -13,6 +13,7 @@ type Embed struct {
 	Ignore         []string
 	ignoreOverride bool
 	embeddedFields []string
+	EmptyValueOk   bool
 }
 
 func (e *Embed) FromInternal(data map[string]interface{}) {
@@ -25,9 +26,9 @@ func (e *Embed) FromInternal(data map[string]interface{}) {
 	delete(data, e.Field)
 }
 
-func (e *Embed) ToInternal(data map[string]interface{}) {
+func (e *Embed) ToInternal(data map[string]interface{}) error {
 	if data == nil {
-		return
+		return nil
 	}
 
 	sub := map[string]interface{}{}
@@ -38,8 +39,14 @@ func (e *Embed) ToInternal(data map[string]interface{}) {
 
 		delete(data, fieldName)
 	}
-
+	if len(sub) == 0 {
+		if e.EmptyValueOk {
+			data[e.Field] = nil
+		}
+		return nil
+	}
 	data[e.Field] = sub
+	return nil
 }
 
 func (e *Embed) ModifySchema(schema *types.Schema, schemas *types.Schemas) error {
@@ -56,14 +63,18 @@ func (e *Embed) ModifySchema(schema *types.Schema, schemas *types.Schemas) error
 	embeddedSchemaID := schema.ResourceFields[e.Field].Type
 	embeddedSchema := schemas.Schema(&schema.Version, embeddedSchemaID)
 	if embeddedSchema == nil {
+		if e.Optional {
+			return nil
+		}
 		return fmt.Errorf("failed to find schema %s for embedding", embeddedSchemaID)
 	}
 
 	deleteField := true
+outer:
 	for name, field := range embeddedSchema.ResourceFields {
 		for _, ignore := range e.Ignore {
 			if ignore == name {
-				continue
+				continue outer
 			}
 		}
 

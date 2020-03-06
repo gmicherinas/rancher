@@ -6,7 +6,7 @@ import (
 	"github.com/rancher/norman/store/transform"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/types/client/management/v3"
+	client "github.com/rancher/types/client/management/v3"
 )
 
 type Store struct {
@@ -18,7 +18,7 @@ func NewScopedStore(key string, store types.Store) *Store {
 	return &Store{
 		Store: &transform.Store{
 			Store: store,
-			Transformer: func(apiContext *types.APIContext, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
+			Transformer: func(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, opt *types.QueryOptions) (map[string]interface{}, error) {
 				if data == nil {
 					return data, nil
 				}
@@ -39,6 +39,5 @@ func (s *Store) Create(apiContext *types.APIContext, schema *types.Schema, data 
 		parts := strings.Split(convert.ToString(data[s.key]), ":")
 		data["namespaceId"] = parts[len(parts)-1]
 	}
-
 	return s.Store.Create(apiContext, schema, data)
 }

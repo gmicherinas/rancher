@@ -1,5 +1,7 @@
 package pki
 
+import "time"
+
 const (
 	CertPathPrefix          = "/etc/kubernetes/ssl/"
 	CertificatesServiceName = "certificates"
@@ -8,16 +10,23 @@ const (
 	CertificatesSecretName  = "k8s-certs"
 	TempCertPath            = "/etc/kubernetes/.tmp/"
 	ClusterConfig           = "cluster.yml"
+	ClusterStateFile        = "cluster-state.yml"
+	ClusterStateEnv         = "CLUSTER_STATE"
+	BundleCertPath          = "/backup/pki.bundle.tar.gz"
 
-	CACertName             = "kube-ca"
-	KubeAPICertName        = "kube-apiserver"
-	KubeControllerCertName = "kube-controller-manager"
-	KubeSchedulerCertName  = "kube-scheduler"
-	KubeProxyCertName      = "kube-proxy"
-	KubeNodeCertName       = "kube-node"
-	EtcdCertName           = "kube-etcd"
-	EtcdClientCACertName   = "kube-etcd-client-ca"
-	EtcdClientCertName     = "kube-etcd-client"
+	CACertName                 = "kube-ca"
+	RequestHeaderCACertName    = "kube-apiserver-requestheader-ca"
+	KubeAPICertName            = "kube-apiserver"
+	KubeControllerCertName     = "kube-controller-manager"
+	KubeSchedulerCertName      = "kube-scheduler"
+	KubeProxyCertName          = "kube-proxy"
+	KubeNodeCertName           = "kube-node"
+	KubeletCertName            = "kube-kubelet"
+	EtcdCertName               = "kube-etcd"
+	EtcdClientCACertName       = "kube-etcd-client-ca"
+	EtcdClientCertName         = "kube-etcd-client"
+	APIProxyClientCertName     = "kube-apiserver-proxy-client"
+	ServiceAccountTokenKeyName = "kube-service-account-token"
 
 	KubeNodeCommonName       = "system:node"
 	KubeNodeOrganizationName = "system:nodes"
@@ -25,4 +34,5 @@ const (
 	KubeAdminCertName         = "kube-admin"
 	KubeAdminOrganizationName = "system:masters"
 	KubeAdminConfigPrefix     = "kube_config_"
+	duration365d              = time.Hour * 24 * 365
 )

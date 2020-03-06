@@ -17,8 +17,8 @@ const (
 	BasicAuthFieldPassword        = "password"
 	BasicAuthFieldProjectID       = "projectId"
 	BasicAuthFieldRemoved         = "removed"
+	BasicAuthFieldUUID            = "uuid"
 	BasicAuthFieldUsername        = "username"
-	BasicAuthFieldUuid            = "uuid"
 )
 
 type BasicAuth struct {
@@ -34,9 +34,10 @@ type BasicAuth struct {
 	Password        string            `json:"password,omitempty" yaml:"password,omitempty"`
 	ProjectID       string            `json:"projectId,omitempty" yaml:"projectId,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 	Username        string            `json:"username,omitempty" yaml:"username,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type BasicAuthCollection struct {
 	types.Collection
 	Data   []BasicAuth `json:"data,omitempty"`
@@ -49,8 +50,10 @@ type BasicAuthClient struct {
 
 type BasicAuthOperations interface {
 	List(opts *types.ListOpts) (*BasicAuthCollection, error)
+	ListAll(opts *types.ListOpts) (*BasicAuthCollection, error)
 	Create(opts *BasicAuth) (*BasicAuth, error)
 	Update(existing *BasicAuth, updates interface{}) (*BasicAuth, error)
+	Replace(existing *BasicAuth) (*BasicAuth, error)
 	ByID(id string) (*BasicAuth, error)
 	Delete(container *BasicAuth) error
 }
@@ -73,10 +76,34 @@ func (c *BasicAuthClient) Update(existing *BasicAuth, updates interface{}) (*Bas
 	return resp, err
 }
 
+func (c *BasicAuthClient) Replace(obj *BasicAuth) (*BasicAuth, error) {
+	resp := &BasicAuth{}
+	err := c.apiClient.Ops.DoReplace(BasicAuthType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *BasicAuthClient) List(opts *types.ListOpts) (*BasicAuthCollection, error) {
 	resp := &BasicAuthCollection{}
 	err := c.apiClient.Ops.DoList(BasicAuthType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *BasicAuthClient) ListAll(opts *types.ListOpts) (*BasicAuthCollection, error) {
+	resp := &BasicAuthCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

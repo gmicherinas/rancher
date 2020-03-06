@@ -1,19 +1,20 @@
 package nodeconfig
 
 import (
+	"encoding/json"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	"encoding/json"
-
+	"github.com/pkg/errors"
 	"github.com/rancher/norman/types/convert"
 	"github.com/rancher/norman/types/values"
 	"github.com/rancher/rancher/pkg/encryptedstore"
-	"github.com/rancher/types/apis/core/v1"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/jailer"
+	v1 "github.com/rancher/types/apis/core/v1"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/api/errors"
-	v12 "k8s.io/client-go/kubernetes/typed/core/v1"
+	k8serror "k8s.io/apimachinery/pkg/api/errors"
 )
 
 const (
@@ -23,27 +24,29 @@ const (
 )
 
 type NodeConfig struct {
-	store   *encryptedstore.GenericEncryptedStore
-	baseDir string
-	id      string
-	cm      map[string]string
+	store           *encryptedstore.GenericEncryptedStore
+	fullMachinePath string
+	jailDir         string
+	id              string
+	cm              map[string]string
 }
 
-func NewStore(namespaceInterface v1.NamespaceInterface, v1Interface v12.CoreV1Interface) (*encryptedstore.GenericEncryptedStore, error) {
-	return encryptedstore.NewGenericEncrypedStore("mc-", "", namespaceInterface, v1Interface)
+func NewStore(namespaceInterface v1.NamespaceInterface, secretsGetter v1.SecretsGetter) (*encryptedstore.GenericEncryptedStore, error) {
+	return encryptedstore.NewGenericEncrypedStore("mc-", "", namespaceInterface, secretsGetter)
 }
 
 func NewNodeConfig(store *encryptedstore.GenericEncryptedStore, node *v3.Node) (*NodeConfig, error) {
-	nodeDir, err := buildBaseHostDir(node.Spec.RequestedHostname)
+	jailDir, fullMachinePath, err := buildBaseHostDir(node.Spec.RequestedHostname, node.Namespace)
 	if err != nil {
 		return nil, err
 	}
-	logrus.Debugf("Created node storage directory %s", nodeDir)
+	logrus.Debugf("Created node storage directory %s", fullMachinePath)
 
 	return &NodeConfig{
-		store:   store,
-		id:      node.Name,
-		baseDir: nodeDir,
+		store:           store,
+		id:              node.Name,
+		fullMachinePath: fullMachinePath,
+		jailDir:         jailDir,
 	}, nil
 }
 
@@ -78,15 +81,21 @@ func (m *NodeConfig) SSHUser() (string, error) {
 }
 
 func (m *NodeConfig) Dir() string {
-	return m.baseDir
+	return m.jailDir
+}
+
+func (m *NodeConfig) FullDir() string {
+	return m.fullMachinePath
 }
 
 func (m *NodeConfig) Cleanup() error {
-	return os.RemoveAll(m.baseDir)
+	logrus.Debugf("Cleaning up [%s]", m.fullMachinePath)
+	return os.RemoveAll(m.fullMachinePath)
 }
 
 func (m *NodeConfig) Remove() error {
 	m.Cleanup()
+	logrus.Debugf("Removing [%v]", m.id)
 	return m.store.Remove(m.id)
 }
 
@@ -95,6 +104,15 @@ func (m *NodeConfig) TLSConfig() (*TLSConfig, error) {
 		return nil, err
 	}
 	return extractTLS(m.cm[configKey])
+}
+
+func (m *NodeConfig) SSHKeyPath() (string, error) {
+	config, err := m.getConfig()
+	if err != nil {
+		return "", err
+	}
+
+	return convert.ToString(values.GetValueN(config, "Driver", "SSHKeyPath")), nil
 }
 
 func (m *NodeConfig) IP() (string, error) {
@@ -116,7 +134,7 @@ func (m *NodeConfig) InternalIP() (string, error) {
 }
 
 func (m *NodeConfig) Save() error {
-	extractedConfig, err := compressConfig(m.baseDir)
+	extractedConfig, err := compressConfig(m.fullMachinePath)
 	if err != nil {
 		return err
 	}
@@ -149,7 +167,90 @@ func (m *NodeConfig) Restore() error {
 		return nil
 	}
 
-	return extractConfig(m.baseDir, data)
+	return extractConfig(m.fullMachinePath, data)
+}
+
+// UpdateAmazonAuth updates the machine config.json file on disk with the most
+// recent version of creds from the cloud credential
+// This code should not be updated or duplicated - it should be deleted once
+// https://github.com/rancher/rancher/issues/24541 is implemented
+func (m *NodeConfig) UpdateAmazonAuth(rawConfig interface{}) (bool, error) {
+	var update bool
+	c := convert.ToMapInterface(rawConfig)
+
+	machines := filepath.Join(m.fullMachinePath, "machines")
+	logrus.Debugf("[UpdateAmazonAuth] machine path %v", machines)
+	files, err := ioutil.ReadDir(machines)
+	if err != nil {
+		// There aren't any machines, nothing to update
+		if os.IsNotExist(err) {
+			return update, nil
+		}
+		return update, err
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			configPath := filepath.Join(machines, file.Name(), "config.json")
+			b, err := ioutil.ReadFile(configPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					// config.json doesn't exist, no changes needed
+					continue
+				}
+				return update, err
+			}
+
+			logrus.Debugf("[UpdateAmazonAuth] config file found, path %v", configPath)
+
+			result := make(map[string]interface{})
+
+			if err := json.Unmarshal(b, &result); err != nil {
+				return update, errors.Wrap(err, "error unmarshaling machine config")
+			}
+
+			if _, ok := result["Driver"]; !ok {
+				logrus.Debug("[UpdateAmazonAuth] config file does not have Data key")
+				// No Driver config so no changes to be made
+				continue
+			}
+
+			driverConfig := convert.ToMapInterface(result["Driver"])
+
+			if _, ok := driverConfig["AccessKey"]; ok {
+				if driverConfig["AccessKey"] != c["accessKey"] {
+					logrus.Debug("[UpdateAmazonAuth] update access key")
+					driverConfig["AccessKey"] = c["accessKey"]
+					update = true
+				}
+			}
+
+			if _, ok := driverConfig["SecretKey"]; ok {
+				if driverConfig["SecretKey"] != c["secretKey"] {
+					logrus.Debug("[UpdateAmazonAuth] update secret key")
+					driverConfig["SecretKey"] = c["secretKey"]
+					update = true
+				}
+
+			}
+
+			if update {
+				result["Driver"] = driverConfig
+
+				out, err := json.Marshal(result)
+				if err != nil {
+					return update, errors.WithMessage(err, "error marshaling new machine config")
+				}
+
+				if err := ioutil.WriteFile(configPath, out, 0600); err != nil {
+					return update, errors.WithMessage(err, "error writing  new machine config")
+				}
+			}
+
+		}
+	}
+
+	return update, nil
 }
 
 func (m *NodeConfig) loadConfig() error {
@@ -172,7 +273,7 @@ func (m *NodeConfig) loadConfig() error {
 
 func (m *NodeConfig) getConfigMap() (map[string]string, error) {
 	configMap, err := m.store.Get(m.id)
-	if errors.IsNotFound(err) {
+	if k8serror.IsNotFound(err) {
 		return nil, nil
 	}
 	if err != nil {
@@ -195,18 +296,18 @@ func (m *NodeConfig) getConfig() (map[string]interface{}, error) {
 	return extractConfigJSON(data)
 }
 
-func buildBaseHostDir(nodeName string) (string, error) {
-	nodeDir := filepath.Join(getWorkDir(), "nodes", nodeName)
-	return nodeDir, os.MkdirAll(nodeDir, 0740)
-}
+func buildBaseHostDir(nodeName string, clusterID string) (string, string, error) {
+	var fullMachinePath string
+	var jailDir string
 
-func getWorkDir() string {
-	workDir := os.Getenv("MACHINE_WORK_DIR")
-	if workDir == "" {
-		workDir = os.Getenv("CATTLE_HOME")
+	suffix := filepath.Join("node", "nodes", nodeName)
+	if dm := os.Getenv("CATTLE_DEV_MODE"); dm != "" {
+		fullMachinePath = filepath.Join(defaultCattleHome, suffix)
+		jailDir = fullMachinePath
+	} else {
+		fullMachinePath = filepath.Join(jailer.BaseJailPath, clusterID, "management-state", suffix)
+		jailDir = filepath.Join("/management-state", suffix)
 	}
-	if workDir == "" {
-		workDir = defaultCattleHome
-	}
-	return filepath.Join(workDir, "node")
+
+	return jailDir, fullMachinePath, os.MkdirAll(fullMachinePath, 0740)
 }

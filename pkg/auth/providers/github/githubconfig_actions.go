@@ -4,16 +4,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-
+	"github.com/rancher/norman/types/convert"
 	"github.com/rancher/rancher/pkg/auth/providers/common"
-	"github.com/rancher/rancher/pkg/auth/tokens"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/apis/management.cattle.io/v3public"
-	"github.com/rancher/types/client/management/v3"
+	client "github.com/rancher/types/client/management/v3"
 )
 
 func (g *ghProvider) formatter(apiContext *types.APIContext, resource *types.RawResource) {
@@ -65,6 +65,12 @@ func formGithubRedirectURLFromMap(config map[string]interface{}) string {
 	hostname, _ := config[client.GithubConfigFieldHostname].(string)
 	clientID, _ := config[client.GithubConfigFieldClientID].(string)
 	tls, _ := config[client.GithubConfigFieldTLS].(bool)
+
+	requestHostname := convert.ToString(config[".host"])
+	clientIDs := convert.ToMapInterface(config["hostnameToClientId"])
+	if otherID, ok := clientIDs[requestHostname]; ok {
+		clientID = convert.ToString(otherID)
+	}
 	return githubRedirectURL(hostname, clientID, tls)
 }
 
@@ -91,14 +97,22 @@ func (g *ghProvider) testAndApply(actionName string, action *types.Action, reque
 		return httperror.NewAPIError(httperror.InvalidBodyContent,
 			fmt.Sprintf("Failed to parse body: %v", err))
 	}
-
 	githubConfig = githubConfigApplyInput.GithubConfig
 	githubLogin := &v3public.GithubLogin{
 		Code: githubConfigApplyInput.Code,
 	}
 
+	if githubConfig.ClientSecret != "" {
+		value, err := common.ReadFromSecret(g.secrets, githubConfig.ClientSecret,
+			strings.ToLower(client.GithubConfigFieldClientSecret))
+		if err != nil {
+			return err
+		}
+		githubConfig.ClientSecret = value
+	}
+
 	//Call provider to testLogin
-	userPrincipal, groupPrincipals, providerInfo, err := g.LoginUser(githubLogin, &githubConfig, true)
+	userPrincipal, groupPrincipals, providerInfo, err := g.LoginUser("", githubLogin, &githubConfig, true)
 	if err != nil {
 		if httperror.IsAPIError(err) {
 			return err
@@ -118,5 +132,5 @@ func (g *ghProvider) testAndApply(actionName string, action *types.Action, reque
 		return httperror.NewAPIError(httperror.ServerError, fmt.Sprintf("Failed to save github config: %v", err))
 	}
 
-	return tokens.CreateTokenAndSetCookie(user.Name, userPrincipal, groupPrincipals, providerInfo, 0, "Token via Githu Configuration", request)
+	return g.tokenMGR.CreateTokenAndSetCookie(user.Name, userPrincipal, groupPrincipals, providerInfo, 0, "Token via Github Configuration", request)
 }

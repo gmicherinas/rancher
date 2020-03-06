@@ -2,18 +2,29 @@ package v1
 
 import (
 	"github.com/rancher/norman/lifecycle"
-	"k8s.io/api/core/v1"
+	"github.com/rancher/norman/resource"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type ConfigMapLifecycle interface {
-	Create(obj *v1.ConfigMap) (*v1.ConfigMap, error)
-	Remove(obj *v1.ConfigMap) (*v1.ConfigMap, error)
-	Updated(obj *v1.ConfigMap) (*v1.ConfigMap, error)
+	Create(obj *v1.ConfigMap) (runtime.Object, error)
+	Remove(obj *v1.ConfigMap) (runtime.Object, error)
+	Updated(obj *v1.ConfigMap) (runtime.Object, error)
 }
 
 type configMapLifecycleAdapter struct {
 	lifecycle ConfigMapLifecycle
+}
+
+func (w *configMapLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *configMapLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *configMapLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -41,12 +52,16 @@ func (w *configMapLifecycleAdapter) Updated(obj runtime.Object) (runtime.Object,
 }
 
 func NewConfigMapLifecycleAdapter(name string, clusterScoped bool, client ConfigMapInterface, l ConfigMapLifecycle) ConfigMapHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(ConfigMapGroupVersionResource)
+	}
 	adapter := &configMapLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *v1.ConfigMap) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *v1.ConfigMap) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

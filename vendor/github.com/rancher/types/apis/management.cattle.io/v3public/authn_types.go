@@ -42,10 +42,84 @@ type GithubLogin struct {
 	Code         string `json:"code" norman:"type=string,required"`
 }
 
+type GoogleOAuthProvider struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	AuthProvider      `json:",inline"`
+
+	RedirectURL string `json:"redirectUrl"`
+}
+
+type GoogleOauthLogin struct {
+	GenericLogin `json:",inline"`
+	Code         string `json:"code" norman:"type=string,required"`
+}
+
 type ActiveDirectoryProvider struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 	AuthProvider      `json:",inline"`
 
 	DefaultLoginDomain string `json:"defaultLoginDomain,omitempty"`
+}
+
+type AzureADProvider struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	AuthProvider      `json:",inline"`
+
+	RedirectURL string `json:"redirectUrl"`
+}
+
+type SamlProvider struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	AuthProvider      `json:",inline"`
+
+	RedirectURL string `json:"redirectUrl"`
+}
+
+type AzureADLogin struct {
+	GenericLogin `json:",inline"`
+	Code         string `json:"code" norman:"type=string,required"`
+}
+
+type OpenLdapProvider struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	AuthProvider      `json:",inline"`
+}
+
+type FreeIpaProvider struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	AuthProvider      `json:",inline"`
+}
+
+type PingProvider struct {
+	SamlProvider `json:",inline"`
+}
+
+type ShibbolethProvider struct {
+	SamlProvider `json:",inline"`
+}
+
+type ADFSProvider struct {
+	SamlProvider `json:",inline"`
+}
+
+type KeyCloakProvider struct {
+	SamlProvider `json:",inline"`
+}
+
+type OKTAProvider struct {
+	SamlProvider `json:",inline"`
+}
+
+type SamlLoginInput struct {
+	FinalRedirectURL string `json:"finalRedirectUrl"`
+}
+
+type SamlLoginOutput struct {
+	IdpRedirectURL string `json:"idpRedirectUrl"`
 }

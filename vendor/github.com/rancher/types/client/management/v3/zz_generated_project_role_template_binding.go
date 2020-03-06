@@ -9,18 +9,19 @@ const (
 	ProjectRoleTemplateBindingFieldAnnotations      = "annotations"
 	ProjectRoleTemplateBindingFieldCreated          = "created"
 	ProjectRoleTemplateBindingFieldCreatorID        = "creatorId"
-	ProjectRoleTemplateBindingFieldGroupId          = "groupId"
-	ProjectRoleTemplateBindingFieldGroupPrincipalId = "groupPrincipalId"
+	ProjectRoleTemplateBindingFieldGroupID          = "groupId"
+	ProjectRoleTemplateBindingFieldGroupPrincipalID = "groupPrincipalId"
 	ProjectRoleTemplateBindingFieldLabels           = "labels"
 	ProjectRoleTemplateBindingFieldName             = "name"
 	ProjectRoleTemplateBindingFieldNamespaceId      = "namespaceId"
 	ProjectRoleTemplateBindingFieldOwnerReferences  = "ownerReferences"
-	ProjectRoleTemplateBindingFieldProjectId        = "projectId"
+	ProjectRoleTemplateBindingFieldProjectID        = "projectId"
 	ProjectRoleTemplateBindingFieldRemoved          = "removed"
-	ProjectRoleTemplateBindingFieldRoleTemplateId   = "roleTemplateId"
-	ProjectRoleTemplateBindingFieldUserId           = "userId"
-	ProjectRoleTemplateBindingFieldUserPrincipalId  = "userPrincipalId"
-	ProjectRoleTemplateBindingFieldUuid             = "uuid"
+	ProjectRoleTemplateBindingFieldRoleTemplateID   = "roleTemplateId"
+	ProjectRoleTemplateBindingFieldServiceAccount   = "serviceAccount"
+	ProjectRoleTemplateBindingFieldUUID             = "uuid"
+	ProjectRoleTemplateBindingFieldUserID           = "userId"
+	ProjectRoleTemplateBindingFieldUserPrincipalID  = "userPrincipalId"
 )
 
 type ProjectRoleTemplateBinding struct {
@@ -28,19 +29,21 @@ type ProjectRoleTemplateBinding struct {
 	Annotations      map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
 	Created          string            `json:"created,omitempty" yaml:"created,omitempty"`
 	CreatorID        string            `json:"creatorId,omitempty" yaml:"creatorId,omitempty"`
-	GroupId          string            `json:"groupId,omitempty" yaml:"groupId,omitempty"`
-	GroupPrincipalId string            `json:"groupPrincipalId,omitempty" yaml:"groupPrincipalId,omitempty"`
+	GroupID          string            `json:"groupId,omitempty" yaml:"groupId,omitempty"`
+	GroupPrincipalID string            `json:"groupPrincipalId,omitempty" yaml:"groupPrincipalId,omitempty"`
 	Labels           map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
 	Name             string            `json:"name,omitempty" yaml:"name,omitempty"`
 	NamespaceId      string            `json:"namespaceId,omitempty" yaml:"namespaceId,omitempty"`
 	OwnerReferences  []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
-	ProjectId        string            `json:"projectId,omitempty" yaml:"projectId,omitempty"`
+	ProjectID        string            `json:"projectId,omitempty" yaml:"projectId,omitempty"`
 	Removed          string            `json:"removed,omitempty" yaml:"removed,omitempty"`
-	RoleTemplateId   string            `json:"roleTemplateId,omitempty" yaml:"roleTemplateId,omitempty"`
-	UserId           string            `json:"userId,omitempty" yaml:"userId,omitempty"`
-	UserPrincipalId  string            `json:"userPrincipalId,omitempty" yaml:"userPrincipalId,omitempty"`
-	Uuid             string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	RoleTemplateID   string            `json:"roleTemplateId,omitempty" yaml:"roleTemplateId,omitempty"`
+	ServiceAccount   string            `json:"serviceAccount,omitempty" yaml:"serviceAccount,omitempty"`
+	UUID             string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UserID           string            `json:"userId,omitempty" yaml:"userId,omitempty"`
+	UserPrincipalID  string            `json:"userPrincipalId,omitempty" yaml:"userPrincipalId,omitempty"`
 }
+
 type ProjectRoleTemplateBindingCollection struct {
 	types.Collection
 	Data   []ProjectRoleTemplateBinding `json:"data,omitempty"`
@@ -53,8 +56,10 @@ type ProjectRoleTemplateBindingClient struct {
 
 type ProjectRoleTemplateBindingOperations interface {
 	List(opts *types.ListOpts) (*ProjectRoleTemplateBindingCollection, error)
+	ListAll(opts *types.ListOpts) (*ProjectRoleTemplateBindingCollection, error)
 	Create(opts *ProjectRoleTemplateBinding) (*ProjectRoleTemplateBinding, error)
 	Update(existing *ProjectRoleTemplateBinding, updates interface{}) (*ProjectRoleTemplateBinding, error)
+	Replace(existing *ProjectRoleTemplateBinding) (*ProjectRoleTemplateBinding, error)
 	ByID(id string) (*ProjectRoleTemplateBinding, error)
 	Delete(container *ProjectRoleTemplateBinding) error
 }
@@ -77,10 +82,34 @@ func (c *ProjectRoleTemplateBindingClient) Update(existing *ProjectRoleTemplateB
 	return resp, err
 }
 
+func (c *ProjectRoleTemplateBindingClient) Replace(obj *ProjectRoleTemplateBinding) (*ProjectRoleTemplateBinding, error) {
+	resp := &ProjectRoleTemplateBinding{}
+	err := c.apiClient.Ops.DoReplace(ProjectRoleTemplateBindingType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *ProjectRoleTemplateBindingClient) List(opts *types.ListOpts) (*ProjectRoleTemplateBindingCollection, error) {
 	resp := &ProjectRoleTemplateBindingCollection{}
 	err := c.apiClient.Ops.DoList(ProjectRoleTemplateBindingType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *ProjectRoleTemplateBindingClient) ListAll(opts *types.ListOpts) (*ProjectRoleTemplateBindingCollection, error) {
+	resp := &ProjectRoleTemplateBindingCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

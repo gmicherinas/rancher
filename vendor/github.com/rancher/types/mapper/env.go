@@ -1,6 +1,8 @@
 package mapper
 
 import (
+	"sort"
+
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
 	"k8s.io/api/core/v1"
@@ -14,7 +16,7 @@ func (e EnvironmentMapper) FromInternal(data map[string]interface{}) {
 	var envFrom []v1.EnvFromSource
 
 	envMap := map[string]interface{}{}
-	var envFromMaps []map[string]interface{}
+	var envFromMaps []interface{}
 
 	if err := convert.ToObj(data["env"], &env); err == nil {
 		for _, envVar := range env {
@@ -44,7 +46,7 @@ func (e EnvironmentMapper) FromInternal(data map[string]interface{}) {
 					"source":     "configMap",
 					"sourceName": envVar.ValueFrom.ConfigMapKeyRef.Name,
 					"sourceKey":  envVar.ValueFrom.ConfigMapKeyRef.Key,
-					"optional":   envVar.ValueFrom.ConfigMapKeyRef.Optional,
+					"optional":   getValue(envVar.ValueFrom.ConfigMapKeyRef.Optional),
 					"targetKey":  envVar.Name,
 				})
 			}
@@ -53,7 +55,7 @@ func (e EnvironmentMapper) FromInternal(data map[string]interface{}) {
 					"source":     "secret",
 					"sourceName": envVar.ValueFrom.SecretKeyRef.Name,
 					"sourceKey":  envVar.ValueFrom.SecretKeyRef.Key,
-					"optional":   envVar.ValueFrom.SecretKeyRef.Optional,
+					"optional":   getValue(envVar.ValueFrom.SecretKeyRef.Optional),
 					"targetKey":  envVar.Name,
 				})
 			}
@@ -67,7 +69,8 @@ func (e EnvironmentMapper) FromInternal(data map[string]interface{}) {
 					"source":     "secret",
 					"sourceName": envVar.SecretRef.Name,
 					"prefix":     envVar.Prefix,
-					"optional":   envVar.SecretRef.Optional,
+					"optional":   getValue(envVar.SecretRef.Optional),
+					"type":       "/v3/project/schemas/environmentFrom",
 				})
 			}
 			if envVar.ConfigMapRef != nil {
@@ -75,7 +78,8 @@ func (e EnvironmentMapper) FromInternal(data map[string]interface{}) {
 					"source":     "configMap",
 					"sourceName": envVar.ConfigMapRef.Name,
 					"prefix":     envVar.Prefix,
-					"optional":   envVar.ConfigMapRef.Optional,
+					"optional":   getValue(envVar.ConfigMapRef.Optional),
+					"type":       "/v3/project/schemas/environmentFrom",
 				})
 			}
 		}
@@ -92,14 +96,20 @@ func (e EnvironmentMapper) FromInternal(data map[string]interface{}) {
 	}
 }
 
-func (e EnvironmentMapper) ToInternal(data map[string]interface{}) {
-	envVar := []map[string]interface{}{}
-	envVarFrom := []map[string]interface{}{}
+func (e EnvironmentMapper) ToInternal(data map[string]interface{}) error {
+	var envVar []map[string]interface{}
+	var envVarFrom []map[string]interface{}
 
-	for key, value := range convert.ToMapInterface(data["environment"]) {
+	var orderedKeys []string
+	environment := convert.ToMapInterface(data["environment"])
+	for k := range environment {
+		orderedKeys = append(orderedKeys, k)
+	}
+	sort.Strings(orderedKeys)
+	for _, key := range orderedKeys {
 		envVar = append(envVar, map[string]interface{}{
 			"name":  key,
-			"value": value,
+			"value": environment[key],
 		})
 	}
 
@@ -110,7 +120,8 @@ func (e EnvironmentMapper) ToInternal(data map[string]interface{}) {
 		}
 
 		targetKey := convert.ToString(value["targetKey"])
-		if targetKey == "" {
+		sourceKey := convert.ToString(value["sourceKey"])
+		if targetKey == "" && sourceKey == "" {
 			switch source {
 			case "secret":
 				envVarFrom = append(envVarFrom, map[string]interface{}{
@@ -130,9 +141,12 @@ func (e EnvironmentMapper) ToInternal(data map[string]interface{}) {
 				})
 			}
 		} else {
+			if targetKey == "" {
+				targetKey = sourceKey
+			}
 			switch source {
 			case "field":
-				envVar = append(envVarFrom, map[string]interface{}{
+				envVar = append(envVar, map[string]interface{}{
 					"name": targetKey,
 					"valueFrom": map[string]interface{}{
 						"fieldRef": map[string]interface{}{
@@ -141,7 +155,7 @@ func (e EnvironmentMapper) ToInternal(data map[string]interface{}) {
 					},
 				})
 			case "resource":
-				envVar = append(envVarFrom, map[string]interface{}{
+				envVar = append(envVar, map[string]interface{}{
 					"name": targetKey,
 					"valueFrom": map[string]interface{}{
 						"resourceFieldRef": map[string]interface{}{
@@ -152,7 +166,7 @@ func (e EnvironmentMapper) ToInternal(data map[string]interface{}) {
 					},
 				})
 			case "configMap":
-				envVar = append(envVarFrom, map[string]interface{}{
+				envVar = append(envVar, map[string]interface{}{
 					"name": targetKey,
 					"valueFrom": map[string]interface{}{
 						"configMapKeyRef": map[string]interface{}{
@@ -163,7 +177,7 @@ func (e EnvironmentMapper) ToInternal(data map[string]interface{}) {
 					},
 				})
 			case "secret":
-				envVar = append(envVarFrom, map[string]interface{}{
+				envVar = append(envVar, map[string]interface{}{
 					"name": targetKey,
 					"valueFrom": map[string]interface{}{
 						"secretKeyRef": map[string]interface{}{
@@ -181,10 +195,19 @@ func (e EnvironmentMapper) ToInternal(data map[string]interface{}) {
 	delete(data, "environmentFrom")
 	data["env"] = envVar
 	data["envFrom"] = envVarFrom
+
+	return nil
 }
 
 func (e EnvironmentMapper) ModifySchema(schema *types.Schema, schemas *types.Schemas) error {
 	delete(schema.ResourceFields, "env")
 	delete(schema.ResourceFields, "envFrom")
 	return nil
+}
+
+func getValue(optional *bool) bool {
+	if optional != nil {
+		return *optional
+	}
+	return false
 }

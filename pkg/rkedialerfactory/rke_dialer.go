@@ -5,13 +5,14 @@ import (
 	"net"
 	"strings"
 
+	"k8s.io/client-go/transport"
+
 	"net/http"
 
 	"github.com/rancher/norman/types/slice"
 	"github.com/rancher/rancher/pkg/ref"
 	"github.com/rancher/rke/hosts"
-	"github.com/rancher/rke/k8s"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config/dialer"
 )
 
@@ -36,7 +37,18 @@ func (t *RKEDialerFactory) Build(h *hosts.Host) (func(network, address string) (
 	return t.Factory.NodeDialer(parts[0], parts[1])
 }
 
-func (t *RKEDialerFactory) WrapTransport(config *v3.RancherKubernetesEngineConfig) k8s.WrapTransport {
+func (t *RKEDialerFactory) WrapTransport(config *v3.RancherKubernetesEngineConfig) transport.WrapperFunc {
+	translateAddress := map[string]string{}
+
+	for _, node := range config.Nodes {
+		if !slice.ContainsString(node.Role, "controlplane") {
+			continue
+		}
+		if node.InternalAddress != "" && node.Address != "" {
+			translateAddress[node.Address] = node.InternalAddress
+		}
+	}
+
 	for _, node := range config.Nodes {
 		if !slice.ContainsString(node.Role, "controlplane") {
 			continue
@@ -52,7 +64,13 @@ func (t *RKEDialerFactory) WrapTransport(config *v3.RancherKubernetesEngineConfi
 			if ht, ok := rt.(*http.Transport); ok {
 				ht.DialContext = nil
 				ht.DialTLS = nil
-				ht.Dial = dialer
+				ht.Dial = func(network, address string) (net.Conn, error) {
+					ip, _, _ := net.SplitHostPort(address)
+					if privateIP, ok := translateAddress[ip]; ok {
+						address = strings.Replace(address, ip, privateIP, 1)
+					}
+					return dialer(network, address)
+				}
 			}
 			return rt
 		}

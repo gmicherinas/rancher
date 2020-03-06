@@ -9,7 +9,7 @@ import (
 
 	"fmt"
 
-	"github.com/rancher/kontainer-engine/drivers"
+	"github.com/rancher/kontainer-engine/drivers/util"
 	"github.com/rancher/kontainer-engine/store"
 	"github.com/rancher/kontainer-engine/types"
 	"github.com/sirupsen/logrus"
@@ -25,12 +25,16 @@ type Driver struct {
 	types.UnimplementedClusterSizeAccess
 }
 
-func NewDriver() *Driver {
+func NewDriver() types.Driver {
 	return &Driver{}
 }
 
 func (d *Driver) GetCapabilities(ctx context.Context) (*types.Capabilities, error) {
 	return &types.Capabilities{Capabilities: make(map[int64]bool)}, nil
+}
+
+func (d *Driver) GetK8SCapabilities(ctx context.Context, opts *types.DriverOptions) (*types.K8SCapabilities, error) {
+	return &types.K8SCapabilities{}, nil
 }
 
 func getDriverOptions() *types.DriverFlags {
@@ -56,7 +60,7 @@ func (d *Driver) GetDriverUpdateOptions(ctx context.Context) (*types.DriverFlags
 	return getDriverOptions(), nil
 }
 
-func (d *Driver) Create(ctx context.Context, opts *types.DriverOptions) (*types.ClusterInfo, error) {
+func (d *Driver) Create(ctx context.Context, opts *types.DriverOptions, _ *types.ClusterInfo) (*types.ClusterInfo, error) {
 	logrus.Info("importing kubeconfig file into clusters")
 
 	configPath := opts.StringOptions["kubeConfigPath"]
@@ -79,6 +83,18 @@ func (d *Driver) Create(ctx context.Context, opts *types.DriverOptions) (*types.
 
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshalling kubeconfig: %v", err)
+	}
+
+	if len(clusters.Clusters) == 0 {
+		return nil, fmt.Errorf("kubeconfig has no clusters")
+	}
+
+	if len(clusters.Contexts) == 0 {
+		return nil, fmt.Errorf("kubeconfig has no contexts")
+	}
+
+	if len(clusters.Users) == 0 {
+		return nil, fmt.Errorf("kubeconfig has no users")
 	}
 
 	info := &types.ClusterInfo{}
@@ -147,7 +163,7 @@ func (d *Driver) PostCheck(ctx context.Context, info *types.ClusterInfo) (*types
 		return nil, fmt.Errorf("failed to get Kubernetes server version: %v", err)
 	}
 
-	info.ServiceAccountToken, err = drivers.GenerateServiceAccountToken(clientset)
+	info.ServiceAccountToken, err = util.GenerateServiceAccountToken(clientset)
 
 	if err != nil {
 		return nil, err
@@ -162,4 +178,20 @@ func (d *Driver) PostCheck(ctx context.Context, info *types.ClusterInfo) (*types
 func (d *Driver) Remove(ctx context.Context, clusterInfo *types.ClusterInfo) error {
 	// Nothing to do
 	return nil
+}
+
+func (d *Driver) ETCDSave(ctx context.Context, clusterInfo *types.ClusterInfo, opts *types.DriverOptions, snapshotName string) error {
+	return fmt.Errorf("ETCD backup operations are not implemented")
+}
+
+func (d *Driver) ETCDRestore(ctx context.Context, clusterInfo *types.ClusterInfo, opts *types.DriverOptions, snapshotName string) (*types.ClusterInfo, error) {
+	return nil, fmt.Errorf("ETCD backup operations are not implemented")
+}
+
+func (d *Driver) ETCDRemoveSnapshot(ctx context.Context, clusterInfo *types.ClusterInfo, opts *types.DriverOptions, snapshotName string) error {
+	return fmt.Errorf("ETCD backup operations are not implemented")
+}
+
+func (d *Driver) RemoveLegacyServiceAccount(ctx context.Context, info *types.ClusterInfo) error {
+	return fmt.Errorf("not implemented")
 }

@@ -1,9 +1,10 @@
 package app
 
 import (
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/settings"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func addLocalCluster(embedded bool, adminName string, management *config.ManagementContext) error {
@@ -17,6 +18,9 @@ func addLocalCluster(embedded bool, adminName string, management *config.Managem
 		Spec: v3.ClusterSpec{
 			Internal:    true,
 			DisplayName: "local",
+			ClusterSpecBase: v3.ClusterSpecBase{
+				DockerRootDir: settings.InitialDockerRootDir.Get(),
+			},
 		},
 		Status: v3.ClusterStatus{
 			Driver: v3.ClusterDriverImported,
@@ -28,5 +32,10 @@ func addLocalCluster(embedded bool, adminName string, management *config.Managem
 
 	// Ignore error
 	management.Management.Clusters("").Create(c)
+	return nil
+}
+
+func removeLocalCluster(management *config.ManagementContext) error {
+	management.Management.Clusters("").Delete("local", &v1.DeleteOptions{})
 	return nil
 }

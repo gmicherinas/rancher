@@ -9,6 +9,7 @@ const (
 	NodeTemplateFieldAnnotations              = "annotations"
 	NodeTemplateFieldAuthCertificateAuthority = "authCertificateAuthority"
 	NodeTemplateFieldAuthKey                  = "authKey"
+	NodeTemplateFieldCloudCredentialID        = "cloudCredentialId"
 	NodeTemplateFieldCreated                  = "created"
 	NodeTemplateFieldCreatorID                = "creatorId"
 	NodeTemplateFieldDescription              = "description"
@@ -23,14 +24,15 @@ const (
 	NodeTemplateFieldEngineStorageDriver      = "engineStorageDriver"
 	NodeTemplateFieldLabels                   = "labels"
 	NodeTemplateFieldName                     = "name"
+	NodeTemplateFieldNodeTaints               = "nodeTaints"
 	NodeTemplateFieldOwnerReferences          = "ownerReferences"
 	NodeTemplateFieldRemoved                  = "removed"
 	NodeTemplateFieldState                    = "state"
 	NodeTemplateFieldStatus                   = "status"
 	NodeTemplateFieldTransitioning            = "transitioning"
 	NodeTemplateFieldTransitioningMessage     = "transitioningMessage"
+	NodeTemplateFieldUUID                     = "uuid"
 	NodeTemplateFieldUseInternalIPAddress     = "useInternalIpAddress"
-	NodeTemplateFieldUuid                     = "uuid"
 )
 
 type NodeTemplate struct {
@@ -38,6 +40,7 @@ type NodeTemplate struct {
 	Annotations              map[string]string   `json:"annotations,omitempty" yaml:"annotations,omitempty"`
 	AuthCertificateAuthority string              `json:"authCertificateAuthority,omitempty" yaml:"authCertificateAuthority,omitempty"`
 	AuthKey                  string              `json:"authKey,omitempty" yaml:"authKey,omitempty"`
+	CloudCredentialID        string              `json:"cloudCredentialId,omitempty" yaml:"cloudCredentialId,omitempty"`
 	Created                  string              `json:"created,omitempty" yaml:"created,omitempty"`
 	CreatorID                string              `json:"creatorId,omitempty" yaml:"creatorId,omitempty"`
 	Description              string              `json:"description,omitempty" yaml:"description,omitempty"`
@@ -52,15 +55,17 @@ type NodeTemplate struct {
 	EngineStorageDriver      string              `json:"engineStorageDriver,omitempty" yaml:"engineStorageDriver,omitempty"`
 	Labels                   map[string]string   `json:"labels,omitempty" yaml:"labels,omitempty"`
 	Name                     string              `json:"name,omitempty" yaml:"name,omitempty"`
+	NodeTaints               []Taint             `json:"nodeTaints,omitempty" yaml:"nodeTaints,omitempty"`
 	OwnerReferences          []OwnerReference    `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
 	Removed                  string              `json:"removed,omitempty" yaml:"removed,omitempty"`
 	State                    string              `json:"state,omitempty" yaml:"state,omitempty"`
 	Status                   *NodeTemplateStatus `json:"status,omitempty" yaml:"status,omitempty"`
 	Transitioning            string              `json:"transitioning,omitempty" yaml:"transitioning,omitempty"`
 	TransitioningMessage     string              `json:"transitioningMessage,omitempty" yaml:"transitioningMessage,omitempty"`
+	UUID                     string              `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 	UseInternalIPAddress     bool                `json:"useInternalIpAddress,omitempty" yaml:"useInternalIpAddress,omitempty"`
-	Uuid                     string              `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type NodeTemplateCollection struct {
 	types.Collection
 	Data   []NodeTemplate `json:"data,omitempty"`
@@ -73,8 +78,10 @@ type NodeTemplateClient struct {
 
 type NodeTemplateOperations interface {
 	List(opts *types.ListOpts) (*NodeTemplateCollection, error)
+	ListAll(opts *types.ListOpts) (*NodeTemplateCollection, error)
 	Create(opts *NodeTemplate) (*NodeTemplate, error)
 	Update(existing *NodeTemplate, updates interface{}) (*NodeTemplate, error)
+	Replace(existing *NodeTemplate) (*NodeTemplate, error)
 	ByID(id string) (*NodeTemplate, error)
 	Delete(container *NodeTemplate) error
 }
@@ -97,10 +104,34 @@ func (c *NodeTemplateClient) Update(existing *NodeTemplate, updates interface{})
 	return resp, err
 }
 
+func (c *NodeTemplateClient) Replace(obj *NodeTemplate) (*NodeTemplate, error) {
+	resp := &NodeTemplate{}
+	err := c.apiClient.Ops.DoReplace(NodeTemplateType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *NodeTemplateClient) List(opts *types.ListOpts) (*NodeTemplateCollection, error) {
 	resp := &NodeTemplateCollection{}
 	err := c.apiClient.Ops.DoList(NodeTemplateType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *NodeTemplateClient) ListAll(opts *types.ListOpts) (*NodeTemplateCollection, error) {
+	resp := &NodeTemplateCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

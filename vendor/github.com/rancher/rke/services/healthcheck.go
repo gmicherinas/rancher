@@ -10,8 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rancher/rke/docker"
 	"github.com/rancher/rke/hosts"
 	"github.com/rancher/rke/log"
+	"github.com/rancher/rke/pki"
+	"github.com/rancher/rke/pki/cert"
 	"github.com/sirupsen/logrus"
 )
 
@@ -22,15 +25,25 @@ const (
 	HTTPSProtoPrefix = "https://"
 )
 
-func runHealthcheck(ctx context.Context, host *hosts.Host, serviceName string, localConnDialerFactory hosts.DialerFactory, url string) error {
+func runHealthcheck(ctx context.Context, host *hosts.Host, serviceName string, localConnDialerFactory hosts.DialerFactory, url string, certMap map[string]pki.CertificatePKI) error {
 	log.Infof(ctx, "[healthcheck] Start Healthcheck on service [%s] on host [%s]", serviceName, host.Address)
+	var x509Pair tls.Certificate
+
 	port, err := getPortFromURL(url)
 	if err != nil {
 		return err
 	}
-	client, err := getHealthCheckHTTPClient(host, port, localConnDialerFactory)
+	if serviceName == KubeAPIContainerName {
+		certificate := cert.EncodeCertPEM(certMap[pki.KubeAPICertName].Certificate)
+		key := cert.EncodePrivateKeyPEM(certMap[pki.KubeAPICertName].Key)
+		x509Pair, err = tls.X509KeyPair(certificate, key)
+		if err != nil {
+			return err
+		}
+	}
+	client, err := getHealthCheckHTTPClient(host, port, localConnDialerFactory, &x509Pair)
 	if err != nil {
-		return fmt.Errorf("Failed to initiate new HTTP client for service [%s] for host [%s]", serviceName, host.Address)
+		return fmt.Errorf("Failed to initiate new HTTP client for service [%s] for host [%s]: %v", serviceName, host.Address, err)
 	}
 	for retries := 0; retries < 10; retries++ {
 		if err = getHealthz(client, serviceName, host.Address, url); err != nil {
@@ -41,10 +54,16 @@ func runHealthcheck(ctx context.Context, host *hosts.Host, serviceName string, l
 		log.Infof(ctx, "[healthcheck] service [%s] on host [%s] is healthy", serviceName, host.Address)
 		return nil
 	}
-	return fmt.Errorf("Failed to verify healthcheck: %v", err)
+	logrus.Debug("Checking container logs")
+	containerLog, _, logserr := docker.GetContainerLogsStdoutStderr(ctx, host.DClient, serviceName, "1", false)
+	containerLog = strings.TrimSuffix(containerLog, "\n")
+	if logserr != nil {
+		return fmt.Errorf("Failed to verify healthcheck for service [%s]: %v", serviceName, logserr)
+	}
+	return fmt.Errorf("Failed to verify healthcheck: %v, log: %v", err, containerLog)
 }
 
-func getHealthCheckHTTPClient(host *hosts.Host, port int, localConnDialerFactory hosts.DialerFactory) (*http.Client, error) {
+func getHealthCheckHTTPClient(host *hosts.Host, port int, localConnDialerFactory hosts.DialerFactory, x509KeyPair *tls.Certificate) (*http.Client, error) {
 	host.LocalConnPort = port
 	var factory hosts.DialerFactory
 	if localConnDialerFactory == nil {
@@ -56,10 +75,17 @@ func getHealthCheckHTTPClient(host *hosts.Host, port int, localConnDialerFactory
 	if err != nil {
 		return nil, fmt.Errorf("Failed to create a dialer for host [%s]: %v", host.Address, err)
 	}
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+	if x509KeyPair != nil {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			Certificates:       []tls.Certificate{*x509KeyPair},
+		}
+	}
 	return &http.Client{
 		Transport: &http.Transport{
 			Dial:            dialer,
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: tlsConfig,
 		},
 	}, nil
 }
@@ -71,7 +97,7 @@ func getHealthz(client *http.Client, serviceName, hostAddress, url string) error
 	}
 	if resp.StatusCode != http.StatusOK {
 		statusBody, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("service [%s] is not healthy response code: [%d], response body: %s", serviceName, resp.StatusCode, statusBody)
+		return fmt.Errorf("Service [%s] is not healthy on host [%s]. Response code: [%d], response body: %s", serviceName, hostAddress, resp.StatusCode, statusBody)
 	}
 	return nil
 }

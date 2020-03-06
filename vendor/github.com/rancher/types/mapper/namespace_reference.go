@@ -20,18 +20,29 @@ func (n *NamespaceReference) FromInternal(data map[string]interface{}) {
 	if ok {
 		for _, path := range n.fields {
 			convert.Transform(data, path, func(input interface{}) interface{} {
+				parts := strings.SplitN(convert.ToString(input), ":", 2)
+				if len(parts) == 2 {
+					return input
+				}
 				return fmt.Sprintf("%s:%v", namespaceID, input)
 			})
 		}
 	}
 }
 
-func (n *NamespaceReference) ToInternal(data map[string]interface{}) {
+func (n *NamespaceReference) ToInternal(data map[string]interface{}) error {
+	namespaceID, ok := data["namespaceId"]
 	for _, path := range n.fields {
 		convert.Transform(data, path, func(input interface{}) interface{} {
-			return strings.SplitN(convert.ToString(input), ":", 2)[0]
+			parts := strings.SplitN(convert.ToString(input), ":", 2)
+			if len(parts) == 2 && (!ok || parts[0] == namespaceID) {
+				return parts[1]
+			}
+			return input
 		})
 	}
+
+	return nil
 }
 
 func (n *NamespaceReference) ModifySchema(schema *types.Schema, schemas *types.Schemas) error {

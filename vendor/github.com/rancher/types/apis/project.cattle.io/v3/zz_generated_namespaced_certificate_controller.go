@@ -2,14 +2,17 @@ package v3
 
 import (
 	"context"
+	"time"
 
-	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/controller"
+	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
@@ -27,15 +30,34 @@ var (
 
 		Kind: NamespacedCertificateGroupVersionKind.Kind,
 	}
+
+	NamespacedCertificateGroupVersionResource = schema.GroupVersionResource{
+		Group:    GroupName,
+		Version:  Version,
+		Resource: "namespacedcertificates",
+	}
 )
+
+func init() {
+	resource.Put(NamespacedCertificateGroupVersionResource)
+}
+
+func NewNamespacedCertificate(namespace, name string, obj NamespacedCertificate) *NamespacedCertificate {
+	obj.APIVersion, obj.Kind = NamespacedCertificateGroupVersionKind.ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
 
 type NamespacedCertificateList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []NamespacedCertificate
+	Items           []NamespacedCertificate `json:"items"`
 }
 
-type NamespacedCertificateHandlerFunc func(key string, obj *NamespacedCertificate) error
+type NamespacedCertificateHandlerFunc func(key string, obj *NamespacedCertificate) (runtime.Object, error)
+
+type NamespacedCertificateChangeHandlerFunc func(obj *NamespacedCertificate) (runtime.Object, error)
 
 type NamespacedCertificateLister interface {
 	List(namespace string, selector labels.Selector) (ret []*NamespacedCertificate, err error)
@@ -43,17 +65,21 @@ type NamespacedCertificateLister interface {
 }
 
 type NamespacedCertificateController interface {
+	Generic() controller.GenericController
 	Informer() cache.SharedIndexInformer
 	Lister() NamespacedCertificateLister
-	AddHandler(name string, handler NamespacedCertificateHandlerFunc)
-	AddClusterScopedHandler(name, clusterName string, handler NamespacedCertificateHandlerFunc)
+	AddHandler(ctx context.Context, name string, handler NamespacedCertificateHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync NamespacedCertificateHandlerFunc)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, handler NamespacedCertificateHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, handler NamespacedCertificateHandlerFunc)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, after time.Duration)
 	Sync(ctx context.Context) error
 	Start(ctx context.Context, threadiness int) error
 }
 
 type NamespacedCertificateInterface interface {
-	ObjectClient() *clientbase.ObjectClient
+	ObjectClient() *objectclient.ObjectClient
 	Create(*NamespacedCertificate) (*NamespacedCertificate, error)
 	GetNamespaced(namespace, name string, opts metav1.GetOptions) (*NamespacedCertificate, error)
 	Get(name string, opts metav1.GetOptions) (*NamespacedCertificate, error)
@@ -61,13 +87,18 @@ type NamespacedCertificateInterface interface {
 	Delete(name string, options *metav1.DeleteOptions) error
 	DeleteNamespaced(namespace, name string, options *metav1.DeleteOptions) error
 	List(opts metav1.ListOptions) (*NamespacedCertificateList, error)
+	ListNamespaced(namespace string, opts metav1.ListOptions) (*NamespacedCertificateList, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOpts *metav1.DeleteOptions, listOpts metav1.ListOptions) error
 	Controller() NamespacedCertificateController
-	AddHandler(name string, sync NamespacedCertificateHandlerFunc)
-	AddLifecycle(name string, lifecycle NamespacedCertificateLifecycle)
-	AddClusterScopedHandler(name, clusterName string, sync NamespacedCertificateHandlerFunc)
-	AddClusterScopedLifecycle(name, clusterName string, lifecycle NamespacedCertificateLifecycle)
+	AddHandler(ctx context.Context, name string, sync NamespacedCertificateHandlerFunc)
+	AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync NamespacedCertificateHandlerFunc)
+	AddLifecycle(ctx context.Context, name string, lifecycle NamespacedCertificateLifecycle)
+	AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle NamespacedCertificateLifecycle)
+	AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync NamespacedCertificateHandlerFunc)
+	AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync NamespacedCertificateHandlerFunc)
+	AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle NamespacedCertificateLifecycle)
+	AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle NamespacedCertificateLifecycle)
 }
 
 type namespacedCertificateLister struct {
@@ -96,7 +127,7 @@ func (l *namespacedCertificateLister) Get(namespace, name string) (*NamespacedCe
 		return nil, errors.NewNotFound(schema.GroupResource{
 			Group:    NamespacedCertificateGroupVersionKind.Group,
 			Resource: "namespacedCertificate",
-		}, name)
+		}, key)
 	}
 	return obj.(*NamespacedCertificate), nil
 }
@@ -105,40 +136,65 @@ type namespacedCertificateController struct {
 	controller.GenericController
 }
 
+func (c *namespacedCertificateController) Generic() controller.GenericController {
+	return c.GenericController
+}
+
 func (c *namespacedCertificateController) Lister() NamespacedCertificateLister {
 	return &namespacedCertificateLister{
 		controller: c,
 	}
 }
 
-func (c *namespacedCertificateController) AddHandler(name string, handler NamespacedCertificateHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *namespacedCertificateController) AddHandler(ctx context.Context, name string, handler NamespacedCertificateHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*NamespacedCertificate); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
-		return handler(key, obj.(*NamespacedCertificate))
 	})
 }
 
-func (c *namespacedCertificateController) AddClusterScopedHandler(name, cluster string, handler NamespacedCertificateHandlerFunc) {
-	c.GenericController.AddHandler(name, func(key string) error {
-		obj, exists, err := c.Informer().GetStore().GetByKey(key)
-		if err != nil {
-			return err
-		}
-		if !exists {
+func (c *namespacedCertificateController) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, handler NamespacedCertificateHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
 			return handler(key, nil)
+		} else if v, ok := obj.(*NamespacedCertificate); ok {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		if !controller.ObjectInCluster(cluster, obj) {
-			return nil
+func (c *namespacedCertificateController) AddClusterScopedHandler(ctx context.Context, name, cluster string, handler NamespacedCertificateHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*NamespacedCertificate); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
 		}
+	})
+}
 
-		return handler(key, obj.(*NamespacedCertificate))
+func (c *namespacedCertificateController) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, cluster string, handler NamespacedCertificateHandlerFunc) {
+	c.GenericController.AddHandler(ctx, name, func(key string, obj interface{}) (interface{}, error) {
+		if !enabled() {
+			return nil, nil
+		} else if obj == nil {
+			return handler(key, nil)
+		} else if v, ok := obj.(*NamespacedCertificate); ok && controller.ObjectInCluster(cluster, obj) {
+			return handler(key, v)
+		} else {
+			return nil, nil
+		}
 	})
 }
 
@@ -178,11 +234,11 @@ func (s *namespacedCertificateClient) Controller() NamespacedCertificateControll
 type namespacedCertificateClient struct {
 	client       *Client
 	ns           string
-	objectClient *clientbase.ObjectClient
+	objectClient *objectclient.ObjectClient
 	controller   NamespacedCertificateController
 }
 
-func (s *namespacedCertificateClient) ObjectClient() *clientbase.ObjectClient {
+func (s *namespacedCertificateClient) ObjectClient() *objectclient.ObjectClient {
 	return s.objectClient
 }
 
@@ -219,13 +275,18 @@ func (s *namespacedCertificateClient) List(opts metav1.ListOptions) (*Namespaced
 	return obj.(*NamespacedCertificateList), err
 }
 
+func (s *namespacedCertificateClient) ListNamespaced(namespace string, opts metav1.ListOptions) (*NamespacedCertificateList, error) {
+	obj, err := s.objectClient.ListNamespaced(namespace, opts)
+	return obj.(*NamespacedCertificateList), err
+}
+
 func (s *namespacedCertificateClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	return s.objectClient.Watch(opts)
 }
 
 // Patch applies the patch and returns the patched deployment.
-func (s *namespacedCertificateClient) Patch(o *NamespacedCertificate, data []byte, subresources ...string) (*NamespacedCertificate, error) {
-	obj, err := s.objectClient.Patch(o.Name, o, data, subresources...)
+func (s *namespacedCertificateClient) Patch(o *NamespacedCertificate, patchType types.PatchType, data []byte, subresources ...string) (*NamespacedCertificate, error) {
+	obj, err := s.objectClient.Patch(o.Name, o, patchType, data, subresources...)
 	return obj.(*NamespacedCertificate), err
 }
 
@@ -233,20 +294,38 @@ func (s *namespacedCertificateClient) DeleteCollection(deleteOpts *metav1.Delete
 	return s.objectClient.DeleteCollection(deleteOpts, listOpts)
 }
 
-func (s *namespacedCertificateClient) AddHandler(name string, sync NamespacedCertificateHandlerFunc) {
-	s.Controller().AddHandler(name, sync)
+func (s *namespacedCertificateClient) AddHandler(ctx context.Context, name string, sync NamespacedCertificateHandlerFunc) {
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *namespacedCertificateClient) AddLifecycle(name string, lifecycle NamespacedCertificateLifecycle) {
+func (s *namespacedCertificateClient) AddFeatureHandler(ctx context.Context, enabled func() bool, name string, sync NamespacedCertificateHandlerFunc) {
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
+}
+
+func (s *namespacedCertificateClient) AddLifecycle(ctx context.Context, name string, lifecycle NamespacedCertificateLifecycle) {
 	sync := NewNamespacedCertificateLifecycleAdapter(name, false, s, lifecycle)
-	s.AddHandler(name, sync)
+	s.Controller().AddHandler(ctx, name, sync)
 }
 
-func (s *namespacedCertificateClient) AddClusterScopedHandler(name, clusterName string, sync NamespacedCertificateHandlerFunc) {
-	s.Controller().AddClusterScopedHandler(name, clusterName, sync)
+func (s *namespacedCertificateClient) AddFeatureLifecycle(ctx context.Context, enabled func() bool, name string, lifecycle NamespacedCertificateLifecycle) {
+	sync := NewNamespacedCertificateLifecycleAdapter(name, false, s, lifecycle)
+	s.Controller().AddFeatureHandler(ctx, enabled, name, sync)
 }
 
-func (s *namespacedCertificateClient) AddClusterScopedLifecycle(name, clusterName string, lifecycle NamespacedCertificateLifecycle) {
+func (s *namespacedCertificateClient) AddClusterScopedHandler(ctx context.Context, name, clusterName string, sync NamespacedCertificateHandlerFunc) {
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *namespacedCertificateClient) AddClusterScopedFeatureHandler(ctx context.Context, enabled func() bool, name, clusterName string, sync NamespacedCertificateHandlerFunc) {
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
+}
+
+func (s *namespacedCertificateClient) AddClusterScopedLifecycle(ctx context.Context, name, clusterName string, lifecycle NamespacedCertificateLifecycle) {
 	sync := NewNamespacedCertificateLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
-	s.AddClusterScopedHandler(name, clusterName, sync)
+	s.Controller().AddClusterScopedHandler(ctx, name, clusterName, sync)
+}
+
+func (s *namespacedCertificateClient) AddClusterScopedFeatureLifecycle(ctx context.Context, enabled func() bool, name, clusterName string, lifecycle NamespacedCertificateLifecycle) {
+	sync := NewNamespacedCertificateLifecycleAdapter(name+"_"+clusterName, true, s, lifecycle)
+	s.Controller().AddClusterScopedFeatureHandler(ctx, enabled, name, clusterName, sync)
 }

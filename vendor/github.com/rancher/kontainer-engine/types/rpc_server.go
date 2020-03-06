@@ -12,14 +12,11 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
-const (
-	listenAddr = "127.0.0.1:"
-)
-
 // GrpcServer defines the server struct
 type GrpcServer struct {
-	driver  Driver
-	address chan string
+	driver     Driver
+	address    chan string
+	grpcServer *grpc.Server
 }
 
 // NewServer creates a grpc server for a specific plugin
@@ -41,8 +38,13 @@ func (s *GrpcServer) GetDriverUpdateOptions(ctx context.Context, in *Empty) (*Dr
 }
 
 // Create implements grpc method
-func (s *GrpcServer) Create(ctx context.Context, opts *DriverOptions) (*ClusterInfo, error) {
-	return s.driver.Create(GetCtx(ctx), opts)
+func (s *GrpcServer) Create(ctx context.Context, create *CreateRequest) (*ClusterInfo, error) {
+	info, err := s.driver.Create(GetCtx(ctx), create.DriverOptions, create.ClusterInfo)
+	if err != nil && info != nil {
+		info.CreateError = err.Error()
+		return info, nil
+	}
+	return info, err
 }
 
 // Update implements grpc method
@@ -70,6 +72,18 @@ func (s *GrpcServer) SetNodeCount(ctx context.Context, request *SetNodeCountRequ
 	return &Empty{}, s.driver.SetClusterSize(GetCtx(ctx), request.Info, request.Count)
 }
 
+func (s *GrpcServer) ETCDSave(ctx context.Context, request *SaveETCDSnapshotRequest) (*Empty, error) {
+	return &Empty{}, s.driver.ETCDSave(ctx, request.Info, request.DriverOptions, request.SnapshotName)
+}
+
+func (s *GrpcServer) ETCDRestore(ctx context.Context, request *RestoreETCDSnapshotRequest) (*ClusterInfo, error) {
+	return s.driver.ETCDRestore(ctx, request.Info, request.DriverOptions, request.SnapshotName)
+}
+
+func (s *GrpcServer) ETCDRemoveSnapshot(ctx context.Context, request *RemoveETCDSnapshotRequest) (*Empty, error) {
+	return &Empty{}, s.driver.ETCDRemoveSnapshot(ctx, request.Info, request.DriverOptions, request.SnapshotName)
+}
+
 // Remove implements grpc method
 func (s *GrpcServer) Remove(ctx context.Context, clusterInfo *ClusterInfo) (*Empty, error) {
 	return &Empty{}, s.driver.Remove(GetCtx(ctx), clusterInfo)
@@ -95,20 +109,50 @@ func (s *GrpcServer) GetCapabilities(ctx context.Context, in *Empty) (*Capabilit
 	return s.driver.GetCapabilities(ctx)
 }
 
-// Serve serves a grpc server
-func (s *GrpcServer) Serve() {
+func (s *GrpcServer) GetK8SCapabilities(ctx context.Context, opts *DriverOptions) (*K8SCapabilities, error) {
+	return s.driver.GetK8SCapabilities(ctx, opts)
+}
+
+func (s *GrpcServer) RemoveLegacyServiceAccount(ctx context.Context, clusterInfo *ClusterInfo) (*Empty, error) {
+	return &Empty{}, s.driver.RemoveLegacyServiceAccount(ctx, clusterInfo)
+}
+
+// Serve serves a grpc server.  Sends errors to the error channel if they occur
+func (s *GrpcServer) Serve(listenAddr string, errChan chan error) {
+	listen, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		errChan <- err
+		return
+	}
+	addr := listen.Addr().String()
+	s.address <- addr
+	s.grpcServer = grpc.NewServer()
+	RegisterDriverServer(s.grpcServer, s)
+	reflection.Register(s.grpcServer)
+	logrus.Debugf("RPC GrpcServer listening on address %s", addr)
+	if err := s.grpcServer.Serve(listen); err != nil {
+		errChan <- err
+	}
+}
+
+// ServeOrDie serves a grpc server or kills the process
+func (s *GrpcServer) ServeOrDie(listenAddr string) {
 	listen, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		logrus.Fatal(err)
 	}
 	addr := listen.Addr().String()
 	s.address <- addr
-	grpcServer := grpc.NewServer()
-	RegisterDriverServer(grpcServer, s)
-	reflection.Register(grpcServer)
-	logrus.Debugf("RPC GrpcServer listening on address %s", addr)
-	if err := grpcServer.Serve(listen); err != nil {
-		logrus.Fatal(err)
+	s.grpcServer = grpc.NewServer()
+	RegisterDriverServer(s.grpcServer, s)
+	reflection.Register(s.grpcServer)
+	logrus.Infof("RPC GrpcServer listening on address %s", addr)
+	if err := s.grpcServer.Serve(listen); err != nil {
+		logrus.Fatalf("%v", err)
 	}
 	return
+}
+
+func (s *GrpcServer) Stop() {
+	s.grpcServer.Stop()
 }

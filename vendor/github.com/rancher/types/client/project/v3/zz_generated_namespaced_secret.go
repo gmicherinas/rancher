@@ -19,7 +19,7 @@ const (
 	NamespacedSecretFieldProjectID       = "projectId"
 	NamespacedSecretFieldRemoved         = "removed"
 	NamespacedSecretFieldStringData      = "stringData"
-	NamespacedSecretFieldUuid            = "uuid"
+	NamespacedSecretFieldUUID            = "uuid"
 )
 
 type NamespacedSecret struct {
@@ -37,8 +37,9 @@ type NamespacedSecret struct {
 	ProjectID       string            `json:"projectId,omitempty" yaml:"projectId,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
 	StringData      map[string]string `json:"stringData,omitempty" yaml:"stringData,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type NamespacedSecretCollection struct {
 	types.Collection
 	Data   []NamespacedSecret `json:"data,omitempty"`
@@ -51,8 +52,10 @@ type NamespacedSecretClient struct {
 
 type NamespacedSecretOperations interface {
 	List(opts *types.ListOpts) (*NamespacedSecretCollection, error)
+	ListAll(opts *types.ListOpts) (*NamespacedSecretCollection, error)
 	Create(opts *NamespacedSecret) (*NamespacedSecret, error)
 	Update(existing *NamespacedSecret, updates interface{}) (*NamespacedSecret, error)
+	Replace(existing *NamespacedSecret) (*NamespacedSecret, error)
 	ByID(id string) (*NamespacedSecret, error)
 	Delete(container *NamespacedSecret) error
 }
@@ -75,10 +78,34 @@ func (c *NamespacedSecretClient) Update(existing *NamespacedSecret, updates inte
 	return resp, err
 }
 
+func (c *NamespacedSecretClient) Replace(obj *NamespacedSecret) (*NamespacedSecret, error) {
+	resp := &NamespacedSecret{}
+	err := c.apiClient.Ops.DoReplace(NamespacedSecretType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *NamespacedSecretClient) List(opts *types.ListOpts) (*NamespacedSecretCollection, error) {
 	resp := &NamespacedSecretCollection{}
 	err := c.apiClient.Ops.DoList(NamespacedSecretType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *NamespacedSecretClient) ListAll(opts *types.ListOpts) (*NamespacedSecretCollection, error) {
+	resp := &NamespacedSecretCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

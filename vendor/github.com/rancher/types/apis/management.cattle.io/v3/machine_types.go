@@ -1,9 +1,11 @@
 package v3
 
 import (
+	"time"
+
 	"github.com/rancher/norman/condition"
 	"github.com/rancher/norman/types"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -40,10 +42,12 @@ type NodeTemplateCondition struct {
 }
 
 type NodeTemplateSpec struct {
-	DisplayName      string `json:"displayName"`
-	Description      string `json:"description"`
-	Driver           string `json:"driver" norman:"nocreate,noupdate"`
-	NodeCommonParams `json:",inline"`
+	DisplayName         string     `json:"displayName"`
+	Description         string     `json:"description"`
+	Driver              string     `json:"driver" norman:"nocreate,noupdate"`
+	CloudCredentialName string     `json:"cloudCredentialName" norman:"type=reference[cloudCredential]"`
+	NodeTaints          []v1.Taint `json:"nodeTaints,omitempty"`
+	NodeCommonParams    `json:",inline"`
 }
 
 type Node struct {
@@ -61,6 +65,20 @@ type Node struct {
 	Status NodeStatus `json:"status"`
 }
 
+func (in *Node) ObjClusterName() string {
+	return in.Namespace
+}
+
+type MetadataUpdate struct {
+	Labels      MapDelta `json:"labels,omitempty"`
+	Annotations MapDelta `json:"annotations,omitempty"`
+}
+
+type MapDelta struct {
+	Add    map[string]string `json:"add,omitempty"`
+	Delete map[string]bool   `json:"delete,omitempty"`
+}
+
 type NodeStatus struct {
 	Conditions         []NodeCondition   `json:"conditions,omitempty"`
 	InternalNodeStatus v1.NodeStatus     `json:"internalNodeStatus,omitempty"`
@@ -72,15 +90,39 @@ type NodeStatus struct {
 	NodeAnnotations    map[string]string `json:"nodeAnnotations,omitempty"`
 	NodeLabels         map[string]string `json:"nodeLabels,omitempty"`
 	NodeTaints         []v1.Taint        `json:"nodeTaints,omitempty"`
+	DockerInfo         *DockerInfo       `json:"dockerInfo,omitempty"`
+}
+
+type DockerInfo struct {
+	ID                 string
+	Driver             string
+	Debug              bool
+	LoggingDriver      string
+	CgroupDriver       string
+	KernelVersion      string
+	OperatingSystem    string
+	OSType             string
+	Architecture       string
+	IndexServerAddress string
+	DockerRootDir      string
+	HTTPProxy          string
+	HTTPSProxy         string
+	NoProxy            string
+	Name               string
+	Labels             []string
+	ExperimentalBuild  bool
+	ServerVersion      string
 }
 
 var (
 	NodeConditionInitialized condition.Cond = "Initialized"
 	NodeConditionProvisioned condition.Cond = "Provisioned"
+	NodeConditionUpdated     condition.Cond = "Updated"
 	NodeConditionRegistered  condition.Cond = "Registered"
 	NodeConditionRemoved     condition.Cond = "Removed"
 	NodeConditionConfigSaved condition.Cond = "Saved"
 	NodeConditionReady       condition.Cond = "Ready"
+	NodeConditionDrained     condition.Cond = "Drained"
 )
 
 type NodeCondition struct {
@@ -114,6 +156,10 @@ type NodePool struct {
 	Status NodePoolStatus `json:"status"`
 }
 
+func (n *NodePool) ObjClusterName() string {
+	return n.Spec.ObjClusterName()
+}
+
 type NodePoolSpec struct {
 	Etcd             bool   `json:"etcd"`
 	ControlPlane     bool   `json:"controlPlane"`
@@ -124,9 +170,16 @@ type NodePoolSpec struct {
 	Quantity        int               `json:"quantity" norman:"required,default=1"`
 	NodeLabels      map[string]string `json:"nodeLabels"`
 	NodeAnnotations map[string]string `json:"nodeAnnotations"`
+	NodeTaints      []v1.Taint        `json:"nodeTaints,omitempty"`
 
 	DisplayName string `json:"displayName"`
 	ClusterName string `json:"clusterName,omitempty" norman:"type=reference[cluster],noupdate,required"`
+
+	DeleteNotReadyAfterSecs time.Duration `json:"deleteNotReadyAfterSecs" norman:"default=0,max=31540000,min=0"`
+}
+
+func (n *NodePoolSpec) ObjClusterName() string {
+	return n.ClusterName
 }
 
 type NodePoolStatus struct {
@@ -143,7 +196,11 @@ type CustomConfig struct {
 	// Optional - Docker socket on the node that will be used in tunneling
 	DockerSocket string `yaml:"docker_socket" json:"dockerSocket,omitempty"`
 	// SSH Private Key
-	SSHKey string `yaml:"ssh_key" json:"sshKey,omitempty"`
+	SSHKey string `yaml:"ssh_key" json:"sshKey,omitempty" norman:"type=password"`
+	// SSH Certificate
+	SSHCert string            `yaml:"ssh_cert" json:"sshCert,omitempty"`
+	Label   map[string]string `yaml:"label" json:"label,omitempty"`
+	Taints  []string          `yaml:"taints" json:"taints,omitempty"`
 }
 
 type NodeSpec struct {
@@ -154,16 +211,18 @@ type NodeSpec struct {
 	Worker           bool   `json:"worker" norman:"noupdate"`
 	NodeTemplateName string `json:"nodeTemplateName,omitempty" norman:"type=reference[nodeTemplate],noupdate"`
 
-	NodePoolName           string            `json:"nodePoolName" norman:"type=reference[nodePool],nocreate,noupdate"`
-	CustomConfig           *CustomConfig     `json:"customConfig"`
-	Imported               bool              `json:"imported"`
-	Description            string            `json:"description,omitempty"`
-	DisplayName            string            `json:"displayName"`
-	RequestedHostname      string            `json:"requestedHostname,omitempty" norman:"type=dnsLabel,nullable,noupdate,required"`
-	ClusterName            string            `json:"clusterName,omitempty" norman:"type=reference[cluster],noupdate,required"`
-	InternalNodeSpec       v1.NodeSpec       `json:"internalNodeSpec"`
-	DesiredNodeLabels      map[string]string `json:"desiredNodeLabels,omitempty"`
-	DesiredNodeAnnotations map[string]string `json:"desiredNodeAnnotations,omitempty"`
+	NodePoolName             string          `json:"nodePoolName" norman:"type=reference[nodePool],nocreate,noupdate"`
+	CustomConfig             *CustomConfig   `json:"customConfig"`
+	Imported                 bool            `json:"imported"`
+	Description              string          `json:"description,omitempty"`
+	DisplayName              string          `json:"displayName"`
+	RequestedHostname        string          `json:"requestedHostname,omitempty" norman:"type=hostname,nullable,noupdate,required"`
+	InternalNodeSpec         v1.NodeSpec     `json:"internalNodeSpec"`
+	DesiredNodeTaints        []v1.Taint      `json:"desiredNodeTaints"`
+	UpdateTaintsFromAPI      *bool           `json:"updateTaintsFromAPI,omitempty"`
+	DesiredNodeUnschedulable string          `json:"desiredNodeUnschedulable,omitempty"`
+	NodeDrainInput           *NodeDrainInput `json:"nodeDrainInput,omitempty"`
+	MetadataUpdate           MetadataUpdate  `json:"metadataUpdate,omitempty"`
 }
 
 type NodeCommonParams struct {
@@ -194,11 +253,15 @@ type NodeDriver struct {
 }
 
 type NodeDriverStatus struct {
-	Conditions []Condition `json:"conditions"`
+	Conditions                  []Condition `json:"conditions"`
+	AppliedURL                  string      `json:"appliedURL"`
+	AppliedChecksum             string      `json:"appliedChecksum"`
+	AppliedDockerMachineVersion string      `json:"appliedDockerMachineVersion"`
 }
 
 var (
 	NodeDriverConditionDownloaded condition.Cond = "Downloaded"
+	NodeDriverConditionInstalled  condition.Cond = "Installed"
 	NodeDriverConditionActive     condition.Cond = "Active"
 	NodeDriverConditionInactive   condition.Cond = "Inactive"
 )
@@ -219,12 +282,62 @@ type Condition struct {
 }
 
 type NodeDriverSpec struct {
+	DisplayName      string   `json:"displayName"`
+	Description      string   `json:"description"`
+	URL              string   `json:"url" norman:"required"`
+	ExternalID       string   `json:"externalId"`
+	Builtin          bool     `json:"builtin"`
+	Active           bool     `json:"active"`
+	Checksum         string   `json:"checksum"`
+	UIURL            string   `json:"uiUrl"`
+	WhitelistDomains []string `json:"whitelistDomains,omitempty"`
+}
+
+type PublicEndpoint struct {
+	NodeName  string   `json:"nodeName,omitempty" norman:"type=reference[/v3/schemas/node],nocreate,noupdate"`
+	Addresses []string `json:"addresses,omitempty" norman:"nocreate,noupdate"`
+	Port      int32    `json:"port,omitempty" norman:"nocreate,noupdate"`
+	Protocol  string   `json:"protocol,omitempty" norman:"nocreate,noupdate"`
+	// for node port service endpoint
+	ServiceName string `json:"serviceName,omitempty" norman:"type=reference[service],nocreate,noupdate"`
+	// for host port endpoint
+	PodName string `json:"podName,omitempty" norman:"type=reference[pod],nocreate,noupdate"`
+	// for ingress endpoint. ServiceName, podName, ingressName are mutually exclusive
+	IngressName string `json:"ingressName,omitempty" norman:"type=reference[ingress],nocreate,noupdate"`
+	// Hostname/path are set for Ingress endpoints
+	Hostname string `json:"hostname,omitempty" norman:"nocreate,noupdate"`
+	Path     string `json:"path,omitempty" norman:"nocreate,noupdate"`
+	// True when endpoint is exposed on every node
+	AllNodes bool `json:"allNodes" norman:"nocreate,noupdate"`
+}
+
+type NodeDrainInput struct {
+	// Drain node even if there are pods not managed by a ReplicationController, Job, or DaemonSet
+	// Drain will not proceed without Force set to true if there are such pods
+	Force bool `yaml:"force" json:"force,omitempty"`
+	// If there are DaemonSet-managed pods, drain will not proceed without IgnoreDaemonSets set to true
+	// (even when set to true, kubectl won't delete pods - so setting default to true)
+	IgnoreDaemonSets bool `yaml:"ignore_daemonsets" json:"ignoreDaemonSets,omitempty" norman:"default=true"`
+	// Continue even if there are pods using emptyDir
+	DeleteLocalData bool `yaml:"delete_local_data" json:"deleteLocalData,omitempty"`
+	//Period of time in seconds given to each pod to terminate gracefully.
+	// If negative, the default value specified in the pod will be used
+	GracePeriod int `yaml:"grace_period" json:"gracePeriod,omitempty" norman:"default=-1"`
+	// Time to wait (in seconds) before giving up for one try
+	Timeout int `yaml:"timeout" json:"timeout" norman:"min=1,max=10800,default=60"`
+}
+
+type CloudCredential struct {
+	types.Namespaced
+
+	metav1.TypeMeta `json:",inline"`
+
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec CloudCredentialSpec `json:"spec"`
+}
+
+type CloudCredentialSpec struct {
 	DisplayName string `json:"displayName"`
-	Description string `json:"description"`
-	URL         string `json:"url" norman:"required"`
-	ExternalID  string `json:"externalId"`
-	Builtin     bool   `json:"builtin"`
-	Active      bool   `json:"active"`
-	Checksum    string `json:"checksum"`
-	UIURL       string `json:"uiUrl"`
+	Description string `json:"description,omitempty"`
 }

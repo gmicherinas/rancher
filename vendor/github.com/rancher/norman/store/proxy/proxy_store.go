@@ -1,15 +1,25 @@
 package proxy
 
 import (
+	"context"
 	ejson "encoding/json"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/rancher/norman/httperror"
+	"github.com/rancher/norman/objectclient/dynamic"
+	"github.com/rancher/norman/pkg/broadcast"
+	"github.com/rancher/norman/restwatch"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
+	"github.com/rancher/norman/types/convert/merge"
 	"github.com/rancher/norman/types/values"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	restclientwatch "k8s.io/client-go/rest/watch"
 )
@@ -31,7 +40,6 @@ var (
 )
 
 type ClientGetter interface {
-	Config(apiContext *types.APIContext, context types.StorageContext) (rest.Config, error)
 	UnversionedClient(apiContext *types.APIContext, context types.StorageContext) (rest.Interface, error)
 	APIExtClient(apiContext *types.APIContext, context types.StorageContext) (clientset.Interface, error)
 }
@@ -45,8 +53,7 @@ type simpleClientGetter struct {
 func NewClientGetterFromConfig(config rest.Config) (ClientGetter, error) {
 	dynamicConfig := config
 	if dynamicConfig.NegotiatedSerializer == nil {
-		configConfig := dynamic.ContentConfig()
-		dynamicConfig.NegotiatedSerializer = configConfig.NegotiatedSerializer
+		dynamicConfig.NegotiatedSerializer = dynamic.NegotiatedSerializer
 	}
 
 	unversionedClient, err := rest.UnversionedRESTClientFor(&dynamicConfig)
@@ -79,6 +86,8 @@ func (s *simpleClientGetter) APIExtClient(apiContext *types.APIContext, context 
 }
 
 type Store struct {
+	sync.Mutex
+
 	clientGetter   ClientGetter
 	storageContext types.StorageContext
 	prefix         []string
@@ -87,9 +96,11 @@ type Store struct {
 	kind           string
 	resourcePlural string
 	authContext    map[string]string
+	close          context.Context
+	broadcasters   map[rest.Interface]*broadcast.Broadcaster
 }
 
-func NewProxyStore(clientGetter ClientGetter, storageContext types.StorageContext,
+func NewProxyStore(ctx context.Context, clientGetter ClientGetter, storageContext types.StorageContext,
 	prefix []string, group, version, kind, resourcePlural string) types.Store {
 	return &errorStore{
 		Store: &Store{
@@ -104,88 +115,185 @@ func NewProxyStore(clientGetter ClientGetter, storageContext types.StorageContex
 				"apiGroup": group,
 				"resource": resourcePlural,
 			},
+			close:        ctx,
+			broadcasters: map[rest.Interface]*broadcast.Broadcaster{},
 		},
 	}
 }
 
-func (p *Store) getUser(apiContext *types.APIContext) string {
+func (s *Store) getUser(apiContext *types.APIContext) string {
 	return apiContext.Request.Header.Get(userAuthHeader)
 }
 
-func (p *Store) doAuthed(apiContext *types.APIContext, request *rest.Request) rest.Result {
+func (s *Store) doAuthed(apiContext *types.APIContext, request *rest.Request) rest.Result {
+	start := time.Now()
+	defer func() {
+		logrus.Debug("GET: ", time.Now().Sub(start), s.resourcePlural)
+	}()
+
 	for _, header := range authHeaders {
 		request.SetHeader(header, apiContext.Request.Header[http.CanonicalHeaderKey(header)]...)
 	}
 	return request.Do()
 }
 
-func (p *Store) k8sClient(apiContext *types.APIContext) (rest.Interface, error) {
-	return p.clientGetter.UnversionedClient(apiContext, p.storageContext)
+func (s *Store) k8sClient(apiContext *types.APIContext) (rest.Interface, error) {
+	return s.clientGetter.UnversionedClient(apiContext, s.storageContext)
 }
 
-func (p *Store) ByID(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
-	_, result, err := p.byID(apiContext, schema, id)
+func (s *Store) ByID(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
+	_, result, err := s.byID(apiContext, schema, id, true)
 	return result, err
 }
 
-func (p *Store) byID(apiContext *types.APIContext, schema *types.Schema, id string) (string, map[string]interface{}, error) {
+func (s *Store) byID(apiContext *types.APIContext, schema *types.Schema, id string, retry bool) (string, map[string]interface{}, error) {
+	splitted := strings.Split(strings.TrimSpace(id), ":")
+	validID := false
+	namespaced := schema.Scope == types.NamespaceScope
+	if namespaced {
+		validID = len(splitted) == 2 && len(strings.TrimSpace(splitted[0])) > 0 && len(strings.TrimSpace(splitted[1])) > 0
+	} else {
+		validID = len(splitted) == 1 && len(strings.TrimSpace(splitted[0])) > 0
+	}
+	if !validID {
+		return "", nil, httperror.NewAPIError(httperror.NotFound, "failed to find resource by id")
+	}
+
 	namespace, id := splitID(id)
 
-	k8sClient, err := p.k8sClient(apiContext)
+	k8sClient, err := s.k8sClient(apiContext)
 	if err != nil {
 		return "", nil, err
 	}
 
-	req := p.common(namespace, k8sClient.Get()).
-		Name(id)
-
-	return p.singleResult(apiContext, schema, req)
-}
-
-func (p *Store) Context() types.StorageContext {
-	return p.storageContext
-}
-
-func (p *Store) List(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) ([]map[string]interface{}, error) {
-	namespace := getNamespace(apiContext, opt)
-
-	k8sClient, err := p.k8sClient(apiContext)
-	if err != nil {
-		return nil, err
+	req := s.common(namespace, k8sClient.Get()).Name(id)
+	if !retry {
+		return s.singleResult(apiContext, schema, req)
 	}
 
-	req := p.common(namespace, k8sClient.Get())
+	var version string
+	var data map[string]interface{}
+	for i := 0; i < 3; i++ {
+		req = s.common(namespace, k8sClient.Get()).Name(id)
+		version, data, err = s.singleResult(apiContext, schema, req)
+		if err != nil {
+			if i < 2 && strings.Contains(err.Error(), "Client.Timeout exceeded") {
+				logrus.Warnf("Retrying GET. Error: %v", err)
+				continue
+			}
+			return version, data, err
+		}
+		return version, data, err
+	}
+	return version, data, err
+}
 
-	resultList := &unstructured.UnstructuredList{}
-	err = req.Do().Into(resultList)
-	if err != nil {
-		return nil, err
+func (s *Store) Context() types.StorageContext {
+	return s.storageContext
+}
+
+func (s *Store) List(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) ([]map[string]interface{}, error) {
+	var resultList unstructured.UnstructuredList
+
+	// if there are no namespaces field in options, a single request is made
+	if opt == nil || opt.Namespaces == nil {
+		ns := getNamespace(apiContext, opt)
+		list, err := s.retryList(ns, apiContext)
+		if err != nil {
+			return nil, err
+		}
+		resultList = *list
+	} else {
+		var (
+			errGroup errgroup.Group
+			mux      sync.Mutex
+		)
+
+		allNS := opt.Namespaces
+		for _, ns := range allNS {
+			nsCopy := ns
+			errGroup.Go(func() error {
+				list, err := s.retryList(nsCopy, apiContext)
+				if err != nil {
+					return err
+				}
+
+				mux.Lock()
+				resultList.Items = append(resultList.Items, list.Items...)
+				mux.Unlock()
+
+				return nil
+			})
+		}
+		if err := errGroup.Wait(); err != nil {
+			return nil, err
+		}
 	}
 
 	var result []map[string]interface{}
 
 	for _, obj := range resultList.Items {
-		result = append(result, p.fromInternal(schema, obj.Object))
+		result = append(result, s.fromInternal(apiContext, schema, obj.Object))
 	}
 
-	return apiContext.AccessControl.FilterList(apiContext, schema, result, p.authContext), nil
+	return apiContext.AccessControl.FilterList(apiContext, schema, result, s.authContext), nil
 }
 
-func (p *Store) Watch(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) (chan map[string]interface{}, error) {
-	namespace := getNamespace(apiContext, opt)
-
-	k8sClient, err := p.k8sClient(apiContext)
+func (s *Store) retryList(namespace string, apiContext *types.APIContext) (*unstructured.UnstructuredList, error) {
+	var resultList *unstructured.UnstructuredList
+	k8sClient, err := s.k8sClient(apiContext)
 	if err != nil {
 		return nil, err
 	}
 
-	timeout := int64(60 * 60)
-	req := p.common(namespace, k8sClient.Get())
+	for i := 0; i < 3; i++ {
+		req := s.common(namespace, k8sClient.Get())
+		start := time.Now()
+		resultList = &unstructured.UnstructuredList{}
+		err = req.Do().Into(resultList)
+		logrus.Debugf("LIST: %v, %v", time.Now().Sub(start), s.resourcePlural)
+		if err != nil {
+			if i < 2 && strings.Contains(err.Error(), "Client.Timeout exceeded") {
+				logrus.Infof("Error on LIST %v: %v. Attempt: %v. Retrying", s.resourcePlural, err, i+1)
+				continue
+			}
+			return resultList, err
+		}
+		return resultList, err
+	}
+	return resultList, err
+}
+
+func (s *Store) Watch(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) (chan map[string]interface{}, error) {
+	c, err := s.shareWatch(apiContext, schema, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	return convert.Chan(c, func(data map[string]interface{}) map[string]interface{} {
+		return apiContext.AccessControl.Filter(apiContext, schema, data, s.authContext)
+	}), nil
+}
+
+func (s *Store) realWatch(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) (chan map[string]interface{}, error) {
+	namespace := getNamespace(apiContext, opt)
+
+	k8sClient, err := s.k8sClient(apiContext)
+	if err != nil {
+		return nil, err
+	}
+
+	if watchClient, ok := k8sClient.(restwatch.WatchClient); ok {
+		k8sClient = watchClient.WatchClient()
+	}
+
+	timeout := int64(60 * 30)
+	req := s.common(namespace, k8sClient.Get())
 	req.VersionedParams(&metav1.ListOptions{
 		Watch:           true,
 		TimeoutSeconds:  &timeout,
 		ResourceVersion: "0",
-	}, dynamic.VersionedParameterEncoderWithV1Fallback)
+	}, metav1.ParameterCodec)
 
 	body, err := req.Stream()
 	if err != nil {
@@ -194,10 +302,11 @@ func (p *Store) Watch(apiContext *types.APIContext, schema *types.Schema, opt *t
 
 	framer := json.Framer.NewFrameReader(body)
 	decoder := streaming.NewDecoder(framer, &unstructuredDecoder{})
-	watcher := watch.NewStreamWatcher(restclientwatch.NewDecoder(decoder, &unstructuredDecoder{}))
+	watcher := watch.NewStreamWatcher(restclientwatch.NewDecoder(decoder, &unstructuredDecoder{}), &errorReporter{})
 
+	watchingContext, cancelWatchingContext := context.WithCancel(apiContext.Request.Context())
 	go func() {
-		<-apiContext.Request.Context().Done()
+		<-watchingContext.Done()
 		logrus.Debugf("stopping watcher for %s", schema.ID)
 		watcher.Stop()
 	}()
@@ -205,21 +314,34 @@ func (p *Store) Watch(apiContext *types.APIContext, schema *types.Schema, opt *t
 	result := make(chan map[string]interface{})
 	go func() {
 		for event := range watcher.ResultChan() {
-			data := event.Object.(*unstructured.Unstructured)
-			p.fromInternal(schema, data.Object)
-			if event.Type == watch.Deleted && data.Object != nil {
-				data.Object[".removed"] = true
+			if data, ok := event.Object.(*metav1.Status); ok {
+				// just logging it, keeping the same behavior as before
+				logrus.Debugf("watcher status for %s: %s", schema.ID, data.Message)
+			} else {
+				data := event.Object.(*unstructured.Unstructured)
+				s.fromInternal(apiContext, schema, data.Object)
+				if event.Type == watch.Deleted && data.Object != nil {
+					data.Object[".removed"] = true
+				}
+				result <- data.Object
 			}
-			result <- apiContext.AccessControl.Filter(apiContext, schema, data.Object, p.authContext)
 		}
 		logrus.Debugf("closing watcher for %s", schema.ID)
 		close(result)
+		cancelWatchingContext()
 	}()
 
 	return result, nil
 }
 
 type unstructuredDecoder struct {
+}
+
+type errorReporter struct {
+}
+
+func (e *errorReporter) AsObject(err error) runtime.Object {
+	return &metav1.Status{Message: err.Error(), Code: http.StatusInternalServerError, Reason: "ClientWatchDecoding"}
 }
 
 func (d *unstructuredDecoder) Decode(data []byte, defaults *schema.GroupVersionKind, into runtime.Object) (runtime.Object, *schema.GroupVersionKind, error) {
@@ -235,7 +357,11 @@ func getNamespace(apiContext *types.APIContext, opt *types.QueryOptions) string 
 	}
 
 	for _, condition := range opt.Conditions {
-		if condition.Field == "namespaceId" && condition.Value != "" {
+		mod := condition.ToCondition().Modifier
+		if condition.Field == "namespaceId" && condition.Value != "" && mod == types.ModifierEQ {
+			return condition.Value
+		}
+		if condition.Field == "namespace" && condition.Value != "" && mod == types.ModifierEQ {
 			return condition.Value
 		}
 	}
@@ -243,118 +369,140 @@ func getNamespace(apiContext *types.APIContext, opt *types.QueryOptions) string 
 	return ""
 }
 
-func (p *Store) Create(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}) (map[string]interface{}, error) {
-	namespace, _ := data["namespaceId"].(string)
-	p.toInternal(schema.Mapper, data)
+func (s *Store) Create(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}) (map[string]interface{}, error) {
+	if err := s.toInternal(schema.Mapper, data); err != nil {
+		return nil, err
+	}
 
-	values.PutValue(data, p.getUser(apiContext), "metadata", "annotations", "field.cattle.io/creatorId")
+	namespace, _ := values.GetValueN(data, "metadata", "namespace").(string)
+
+	values.PutValue(data, s.getUser(apiContext), "metadata", "annotations", "field.cattle.io/creatorId")
+	values.PutValue(data, "norman", "metadata", "labels", "cattle.io/creator")
 
 	name, _ := values.GetValueN(data, "metadata", "name").(string)
 	if name == "" {
 		generated, _ := values.GetValueN(data, "metadata", "generateName").(string)
 		if generated == "" {
-			values.PutValue(data, strings.ToLower(schema.ID+"-"), "metadata", "generateName")
+			values.PutValue(data, types.GenerateTypePrefix(schema.ID), "metadata", "generateName")
 		}
 	}
 
-	k8sClient, err := p.k8sClient(apiContext)
+	k8sClient, err := s.k8sClient(apiContext)
 	if err != nil {
 		return nil, err
 	}
 
-	req := p.common(namespace, k8sClient.Post()).
+	req := s.common(namespace, k8sClient.Post()).
 		Body(&unstructured.Unstructured{
 			Object: data,
 		})
 
-	_, result, err := p.singleResult(apiContext, schema, req)
+	_, result, err := s.singleResult(apiContext, schema, req)
 	return result, err
 }
 
-func (p *Store) toInternal(mapper types.Mapper, data map[string]interface{}) {
+func (s *Store) toInternal(mapper types.Mapper, data map[string]interface{}) error {
 	if mapper != nil {
-		mapper.ToInternal(data)
+		if err := mapper.ToInternal(data); err != nil {
+			return err
+		}
 	}
 
-	if p.group == "" {
-		data["apiVersion"] = p.version
+	if s.group == "" {
+		data["apiVersion"] = s.version
 	} else {
-		data["apiVersion"] = p.group + "/" + p.version
+		data["apiVersion"] = s.group + "/" + s.version
 	}
-	data["kind"] = p.kind
+	data["kind"] = s.kind
+	return nil
 }
 
-func (p *Store) Update(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, id string) (map[string]interface{}, error) {
-	k8sClient, err := p.k8sClient(apiContext)
+func (s *Store) Update(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, id string) (map[string]interface{}, error) {
+	var (
+		result map[string]interface{}
+		err    error
+	)
+
+	k8sClient, err := s.k8sClient(apiContext)
 	if err != nil {
 		return nil, err
 	}
 
 	namespace, id := splitID(id)
-	req := p.common(namespace, k8sClient.Get()).
-		Name(id)
-
-	resourceVersion, existing, err := p.singleResultRaw(apiContext, schema, req)
-	if err != nil {
-		return data, nil
+	if err := s.toInternal(schema.Mapper, data); err != nil {
+		return nil, err
 	}
 
-	p.toInternal(schema.Mapper, data)
-	existing = convert.APIUpdateMerge(existing, data, apiContext.Query.Get("_replace") == "true")
+	for i := 0; i < 5; i++ {
+		req := s.common(namespace, k8sClient.Get()).
+			Name(id)
 
-	values.PutValue(existing, resourceVersion, "metadata", "resourceVersion")
-	values.PutValue(existing, namespace, "metadata", "namespace")
-	values.PutValue(existing, id, "metadata", "name")
+		resourceVersion, existing, rawErr := s.singleResultRaw(apiContext, schema, req)
+		if rawErr != nil {
+			return nil, rawErr
+		}
 
-	req = p.common(namespace, k8sClient.Put()).
-		Body(&unstructured.Unstructured{
-			Object: existing,
-		}).
-		Name(id)
+		existing = merge.APIUpdateMerge(schema.InternalSchema, apiContext.Schemas, existing, data, apiContext.Option("replace") == "true")
 
-	_, result, err := p.singleResult(apiContext, schema, req)
+		values.PutValue(existing, resourceVersion, "metadata", "resourceVersion")
+		values.PutValue(existing, namespace, "metadata", "namespace")
+		values.PutValue(existing, id, "metadata", "name")
+
+		req = s.common(namespace, k8sClient.Put()).
+			Body(&unstructured.Unstructured{
+				Object: existing,
+			}).
+			Name(id)
+
+		_, result, err = s.singleResult(apiContext, schema, req)
+		if errors.IsConflict(err) {
+			continue
+		}
+		return result, err
+	}
+
 	return result, err
 }
 
-func (p *Store) Delete(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
-	k8sClient, err := p.k8sClient(apiContext)
+func (s *Store) Delete(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
+	k8sClient, err := s.k8sClient(apiContext)
 	if err != nil {
 		return nil, err
 	}
 
-	namespace, id := splitID(id)
+	namespace, name := splitID(id)
+	options, err := getDeleteOption(apiContext.Request)
+	if err != nil {
+		return nil, err
+	}
+	req := s.common(namespace, k8sClient.Delete()).
+		Body(options).
+		Name(name)
 
-	prop := metav1.DeletePropagationForeground
-	req := p.common(namespace, k8sClient.Delete()).
-		Body(&metav1.DeleteOptions{
-			PropagationPolicy: &prop,
-		}).
-		Name(id)
-
-	err = p.doAuthed(apiContext, req).Error()
+	err = s.doAuthed(apiContext, req).Error()
 	if err != nil {
 		return nil, err
 	}
 
-	obj, err := p.ByID(apiContext, schema, id)
+	_, obj, err := s.byID(apiContext, schema, id, false)
 	if err != nil {
 		return nil, nil
 	}
 	return obj, nil
 }
 
-func (p *Store) singleResult(apiContext *types.APIContext, schema *types.Schema, req *rest.Request) (string, map[string]interface{}, error) {
-	version, data, err := p.singleResultRaw(apiContext, schema, req)
+func (s *Store) singleResult(apiContext *types.APIContext, schema *types.Schema, req *rest.Request) (string, map[string]interface{}, error) {
+	version, data, err := s.singleResultRaw(apiContext, schema, req)
 	if err != nil {
 		return "", nil, err
 	}
-	p.fromInternal(schema, data)
+	s.fromInternal(apiContext, schema, data)
 	return version, data, nil
 }
 
-func (p *Store) singleResultRaw(apiContext *types.APIContext, schema *types.Schema, req *rest.Request) (string, map[string]interface{}, error) {
+func (s *Store) singleResultRaw(apiContext *types.APIContext, schema *types.Schema, req *rest.Request) (string, map[string]interface{}, error) {
 	result := &unstructured.Unstructured{}
-	err := p.doAuthed(apiContext, req).Into(result)
+	err := s.doAuthed(apiContext, req).Into(result)
 	if err != nil {
 		return "", nil, err
 	}
@@ -373,14 +521,26 @@ func splitID(id string) (string, string) {
 	return namespace, id
 }
 
-func (p *Store) common(namespace string, req *rest.Request) *rest.Request {
-	prefix := append([]string{}, p.prefix...)
-	if p.group != "" {
-		prefix = append(prefix, p.group)
+func getDeleteOption(req *http.Request) (*metav1.DeleteOptions, error) {
+	options := &metav1.DeleteOptions{}
+	if err := metav1.ParameterCodec.DecodeParameters(req.URL.Query(), metav1.SchemeGroupVersion, options); err != nil {
+		return nil, err
 	}
-	prefix = append(prefix, p.version)
+	prop := metav1.DeletePropagationBackground
+	if options.PropagationPolicy == nil {
+		options.PropagationPolicy = &prop
+	}
+	return options, nil
+}
+
+func (s *Store) common(namespace string, req *rest.Request) *rest.Request {
+	prefix := append([]string{}, s.prefix...)
+	if s.group != "" {
+		prefix = append(prefix, s.group)
+	}
+	prefix = append(prefix, s.version)
 	req.Prefix(prefix...).
-		Resource(p.resourcePlural)
+		Resource(s.resourcePlural)
 
 	if namespace != "" {
 		req.Namespace(namespace)
@@ -389,7 +549,10 @@ func (p *Store) common(namespace string, req *rest.Request) *rest.Request {
 	return req
 }
 
-func (p *Store) fromInternal(schema *types.Schema, data map[string]interface{}) map[string]interface{} {
+func (s *Store) fromInternal(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}) map[string]interface{} {
+	if apiContext.Option("export") == "true" {
+		delete(data, "status")
+	}
 	if schema.Mapper != nil {
 		schema.Mapper.FromInternal(data)
 	}

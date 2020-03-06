@@ -1,106 +1,72 @@
 package rkecerts
 
 import (
-	"context"
+	"bytes"
+	"crypto/md5"
 	"crypto/rsa"
-	"encoding/json"
-	"fmt"
-	"io"
+	"crypto/x509"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	"crypto/x509"
+	"context"
 
-	"bytes"
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+	"time"
 
+	"github.com/ghodss/yaml"
+	"github.com/rancher/kontainer-engine/drivers/rke/rkecerts"
 	"github.com/rancher/norman/types"
-	"github.com/rancher/rancher/pkg/kubeconfig"
+	"github.com/rancher/rancher/pkg/librke"
 	"github.com/rancher/rke/pki"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"k8s.io/client-go/util/cert"
+	"github.com/rancher/rke/pki/cert"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/sirupsen/logrus"
+	k8sclientv1 "k8s.io/client-go/tools/clientcmd/api/v1"
 )
 
 const (
 	bundleFile = "./management-state/certs/bundle.json"
 )
 
-var (
-	nodeCfg   = "/etc/kubernetes/ssl/kubecfg-kube-node.yaml"
-	proxyCfg  = "/etc/kubernetes/ssl/kubecfg-kube-proxy.yaml"
-	copyCerts = []string{
-		"kube-apiserver",
-	}
-)
-
-type savedCertificatePKI struct {
-	pki.CertificatePKI
-	CertPEM string
-	KeyPEM  string
-}
-
 type Bundle struct {
 	certs map[string]pki.CertificatePKI
 }
 
+func NewBundle(certs map[string]pki.CertificatePKI) *Bundle {
+	return &Bundle{
+		certs: certs,
+	}
+}
+
 func Unmarshal(input string) (*Bundle, error) {
-	return load(bytes.NewBufferString(input))
+	certs, err := rkecerts.LoadString(input)
+	return NewBundle(certs), err
 }
 
 func (b *Bundle) Certs() map[string]pki.CertificatePKI {
 	return b.certs
 }
 
-func Load() (*Bundle, error) {
+func LoadLocal() (*Bundle, error) {
 	f, err := os.Open(bundleFile)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	return load(f)
-}
-
-func load(f io.Reader) (*Bundle, error) {
-	saved := map[string]savedCertificatePKI{}
-	if err := json.NewDecoder(f).Decode(&saved); err != nil {
+	certMap, err := rkecerts.Load(f)
+	if err != nil {
 		return nil, err
 	}
-
-	bundle := &Bundle{
-		certs: map[string]pki.CertificatePKI{},
-	}
-
-	for name, savedCert := range saved {
-		if savedCert.CertPEM != "" {
-			certs, err := cert.ParseCertsPEM([]byte(savedCert.CertPEM))
-			if err != nil {
-				return nil, err
-			}
-
-			if len(certs) == 0 {
-				return nil, fmt.Errorf("failed to parse certs, 0 found")
-			}
-
-			savedCert.Certificate = certs[0]
-		}
-
-		if savedCert.KeyPEM != "" {
-			key, err := cert.ParsePrivateKeyPEM([]byte(savedCert.KeyPEM))
-			if err != nil {
-				return nil, err
-			}
-			savedCert.Key = key.(*rsa.PrivateKey)
-		}
-
-		bundle.certs[name] = savedCert.CertificatePKI
-	}
-
-	return bundle, nil
+	return NewBundle(certMap), nil
 }
 
-func Generate(ctx context.Context, config *v3.RancherKubernetesEngineConfig) (*Bundle, error) {
-	certs, err := pki.GenerateRKECerts(ctx, *config, "", "")
+func Generate(config *v3.RancherKubernetesEngineConfig) (*Bundle, error) {
+	certs, err := librke.New().GenerateCerts(config)
 	if err != nil {
 		return nil, err
 	}
@@ -112,69 +78,76 @@ func Generate(ctx context.Context, config *v3.RancherKubernetesEngineConfig) (*B
 
 func (b *Bundle) Marshal() (string, error) {
 	output := &bytes.Buffer{}
-	err := b.save(output)
+	err := rkecerts.Save(b.certs, output)
 	return output.String(), err
 }
 
-func (b *Bundle) save(w io.Writer) error {
-	toSave := map[string]savedCertificatePKI{}
-
-	for name, bundleCert := range b.certs {
-		toSaveCert := savedCertificatePKI{
-			CertificatePKI: bundleCert,
-		}
-
-		if toSaveCert.Certificate != nil {
-			toSaveCert.CertPEM = string(cert.EncodeCertPEM(toSaveCert.Certificate))
-		}
-
-		if toSaveCert.Key != nil {
-			toSaveCert.KeyPEM = string(cert.EncodePrivateKeyPEM(toSaveCert.Key))
-		}
-
-		toSaveCert.Certificate = nil
-		toSaveCert.Key = nil
-
-		toSave[name] = toSaveCert
+// SafeMarshal removes the kube-ca cert key from the cert bundle before marshalling
+func (b *Bundle) SafeMarshal() (string, error) {
+	output := &bytes.Buffer{}
+	certs := b.certs
+	if pkiCert, ok := certs[pki.CACertName]; ok {
+		pkiCert.Key = nil
+		certs[pki.CACertName] = pkiCert
 	}
+	err := rkecerts.Save(certs, output)
+	return output.String(), err
 
-	return json.NewEncoder(w).Encode(toSave)
 }
 
-func (b *Bundle) ForNode(config *v3.RancherKubernetesEngineConfig, node *v3.RKEConfigNode, server, token string) (*Bundle, error) {
-	certs := pki.GenerateRKENodeCerts(context.Background(), *config, node.Address, b.certs)
-
-	updates := map[string]string{}
-	nameToUser := map[string]string{
-		nodeCfg:  node.HostnameOverride,
-		proxyCfg: "kube-proxy",
+func (b *Bundle) ForNode(config *v3.RancherKubernetesEngineConfig, nodeAddress string) *Bundle {
+	certs := librke.New().GenerateRKENodeCerts(context.Background(), *config, nodeAddress, b.certs)
+	return &Bundle{
+		certs: certs,
 	}
+}
 
-	for name, user := range nameToUser {
-		newCfg, err := kubeconfig.ForBasic(server, user, token)
-		if err != nil {
-			return nil, err
+func (b *Bundle) ForWindowsNode(config *v3.RancherKubernetesEngineConfig, nodeAddress string) *Bundle {
+	nb := b.ForNode(config, nodeAddress)
+
+	certs := make(map[string]pki.CertificatePKI, len(nb.certs))
+	for key, cert := range nb.certs {
+		if len(cert.Config) != 0 {
+			config := &k8sclientv1.Config{}
+
+			if err := yaml.Unmarshal([]byte(cert.Config), config); err == nil {
+				clusterAmount := len(config.Clusters)
+				for i := 0; i < clusterAmount; i++ {
+					cluster := &config.Clusters[i].Cluster
+
+					if len(cluster.CertificateAuthority) != 0 {
+						cluster.CertificateAuthority = "c:" + cluster.CertificateAuthority
+					}
+				}
+
+				authInfoAmount := len(config.AuthInfos)
+				for i := 0; i < authInfoAmount; i++ {
+					authInfo := &config.AuthInfos[i].AuthInfo
+
+					if len(authInfo.ClientCertificate) != 0 {
+						authInfo.ClientCertificate = "c:" + authInfo.ClientCertificate
+					}
+
+					if len(authInfo.ClientKey) != 0 {
+						authInfo.ClientKey = "c:" + authInfo.ClientKey
+					}
+				}
+
+				if configYamlBytes, err := yaml.Marshal(config); err == nil {
+					cert.Config = string(configYamlBytes)
+				}
+			}
 		}
-		updates[name] = newCfg
-	}
 
-	for name, cert := range certs {
-		if newCfg, ok := updates[cert.ConfigPath]; ok {
-			cert.Config = newCfg
-			certs[name] = cert
-		}
-	}
-
-	for _, name := range copyCerts {
-		certs[name] = b.certs[name]
+		certs[key] = cert
 	}
 
 	return &Bundle{
 		certs: certs,
-	}, nil
+	}
 }
 
-func (b *Bundle) Save() error {
+func (b *Bundle) SaveLocal() error {
 	bundlePath := filepath.Dir(bundleFile)
 	if err := os.MkdirAll(bundlePath, 0700); err != nil {
 		return err
@@ -187,7 +160,7 @@ func (b *Bundle) Save() error {
 	defer f.Close()
 	defer os.Remove(f.Name())
 
-	if err := b.save(f); err != nil {
+	if err := rkecerts.Save(b.certs, f); err != nil {
 		return err
 	}
 
@@ -214,6 +187,64 @@ func (b *Bundle) Explode() error {
 	return f.err()
 }
 
+func (b *Bundle) Changed() bool {
+	var newCertPEM string
+	for _, item := range b.certs {
+		// Skip empty kube-kubelet certificates that are created for other workers
+		if item.Name == "" {
+			continue
+		}
+		oldCertPEM, err := ioutil.ReadFile(item.Path)
+		if err != nil {
+			logrus.Warnf("Unable to read certificate %s: %v", item.Name, err)
+			return false
+		}
+		if item.Certificate != nil {
+			newCertPEM = string(cert.EncodeCertPEM(item.Certificate))
+		}
+
+		// kube-kubelet certificates will always be different as they are created on-demand, we need to limit replacing them only if its absolutely necessary
+		if strings.HasPrefix(item.Name, "kube-kubelet") {
+			// Check if expired
+			oldCertX509, err := cert.ParseCertsPEM(oldCertPEM)
+			if err != nil {
+				logrus.Errorf("Error parsing old certificate PEM for [%s]: %v", item.Name, err)
+			}
+			now := time.Now()
+			if len(oldCertX509) > 0 {
+				if now.After(oldCertX509[0].NotAfter) {
+					logrus.Infof("Bundle changed: now [%v] is after certificate NotAfter [%v] for certificate [%s]", now, oldCertX509[0].NotAfter, item.Name)
+					return true
+				}
+			}
+			// Check if AltNames changed
+			if newCertPEM != "" {
+				newCertX509, err := cert.ParseCertsPEM([]byte(newCertPEM))
+				if err != nil {
+					logrus.Errorf("Error parsing new certificate PEM for [%s]: %v", item.Name, err)
+				}
+				if len(newCertX509) > 0 {
+					sort.Strings(oldCertX509[0].DNSNames)
+					sort.Strings(newCertX509[0].DNSNames)
+					if !reflect.DeepEqual(oldCertX509[0].DNSNames, newCertX509[0].DNSNames) || !pki.DeepEqualIPsAltNames(oldCertX509[0].IPAddresses, newCertX509[0].IPAddresses) {
+						logrus.Infof("Bundle changed: DNSNames and/or IPAddresses changed for certificate [%s]: oldCert.DNSNames %v, newCert.DNSNames %v, oldCert.IPAddresses %v, newCert.IPAddresses %v", item.Name, oldCertX509[0].DNSNames, newCertX509[0].DNSNames, oldCertX509[0].IPAddresses, newCertX509[0].IPAddresses)
+						return true
+					}
+				}
+			}
+			continue
+		}
+		oldCertChecksum := fmt.Sprintf("%x", md5.Sum([]byte(oldCertPEM)))
+		newCertChecksum := fmt.Sprintf("%x", md5.Sum([]byte(newCertPEM)))
+
+		if oldCertChecksum != newCertChecksum {
+			logrus.Infof("Certificate checksum changed (old: [%s], new [%s]) for [%s]", oldCertChecksum, newCertChecksum, item.Name)
+			return true
+		}
+	}
+	return false
+}
+
 type fileWriter struct {
 	errs []error
 }
@@ -228,6 +259,11 @@ func (f *fileWriter) write(path string, content []byte, x509cert *x509.Certifica
 	}
 
 	if path == "" || len(content) == 0 {
+		return
+	}
+
+	existing, err := ioutil.ReadFile(path)
+	if err == nil && bytes.Equal(existing, content) {
 		return
 	}
 

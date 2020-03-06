@@ -7,28 +7,35 @@ import (
 const (
 	ConfigMapType                 = "configMap"
 	ConfigMapFieldAnnotations     = "annotations"
+	ConfigMapFieldBinaryData      = "binaryData"
 	ConfigMapFieldCreated         = "created"
 	ConfigMapFieldCreatorID       = "creatorId"
 	ConfigMapFieldData            = "data"
 	ConfigMapFieldLabels          = "labels"
 	ConfigMapFieldName            = "name"
+	ConfigMapFieldNamespaceId     = "namespaceId"
 	ConfigMapFieldOwnerReferences = "ownerReferences"
+	ConfigMapFieldProjectID       = "projectId"
 	ConfigMapFieldRemoved         = "removed"
-	ConfigMapFieldUuid            = "uuid"
+	ConfigMapFieldUUID            = "uuid"
 )
 
 type ConfigMap struct {
 	types.Resource
 	Annotations     map[string]string `json:"annotations,omitempty" yaml:"annotations,omitempty"`
+	BinaryData      map[string]string `json:"binaryData,omitempty" yaml:"binaryData,omitempty"`
 	Created         string            `json:"created,omitempty" yaml:"created,omitempty"`
 	CreatorID       string            `json:"creatorId,omitempty" yaml:"creatorId,omitempty"`
 	Data            map[string]string `json:"data,omitempty" yaml:"data,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
 	Name            string            `json:"name,omitempty" yaml:"name,omitempty"`
+	NamespaceId     string            `json:"namespaceId,omitempty" yaml:"namespaceId,omitempty"`
 	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty" yaml:"ownerReferences,omitempty"`
+	ProjectID       string            `json:"projectId,omitempty" yaml:"projectId,omitempty"`
 	Removed         string            `json:"removed,omitempty" yaml:"removed,omitempty"`
-	Uuid            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID            string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 }
+
 type ConfigMapCollection struct {
 	types.Collection
 	Data   []ConfigMap `json:"data,omitempty"`
@@ -41,8 +48,10 @@ type ConfigMapClient struct {
 
 type ConfigMapOperations interface {
 	List(opts *types.ListOpts) (*ConfigMapCollection, error)
+	ListAll(opts *types.ListOpts) (*ConfigMapCollection, error)
 	Create(opts *ConfigMap) (*ConfigMap, error)
 	Update(existing *ConfigMap, updates interface{}) (*ConfigMap, error)
+	Replace(existing *ConfigMap) (*ConfigMap, error)
 	ByID(id string) (*ConfigMap, error)
 	Delete(container *ConfigMap) error
 }
@@ -65,10 +74,34 @@ func (c *ConfigMapClient) Update(existing *ConfigMap, updates interface{}) (*Con
 	return resp, err
 }
 
+func (c *ConfigMapClient) Replace(obj *ConfigMap) (*ConfigMap, error) {
+	resp := &ConfigMap{}
+	err := c.apiClient.Ops.DoReplace(ConfigMapType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *ConfigMapClient) List(opts *types.ListOpts) (*ConfigMapCollection, error) {
 	resp := &ConfigMapCollection{}
 	err := c.apiClient.Ops.DoList(ConfigMapType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *ConfigMapClient) ListAll(opts *types.ListOpts) (*ConfigMapCollection, error) {
+	resp := &ConfigMapCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 

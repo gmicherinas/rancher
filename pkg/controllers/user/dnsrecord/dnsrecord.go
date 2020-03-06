@@ -7,10 +7,13 @@ import (
 	"reflect"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/runtime"
+
 	"sync"
 
 	"github.com/pkg/errors"
-	"github.com/rancher/types/apis/core/v1"
+	"github.com/rancher/norman/types/convert"
+	v1 "github.com/rancher/types/apis/core/v1"
 	"github.com/rancher/types/config"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -19,19 +22,23 @@ import (
 )
 
 const (
-	DNSAnnotation = "field.cattle.io/targetDnsRecordIds"
+	DNSAnnotation       = "field.cattle.io/targetDnsRecordIds"
+	SvcTypeExternalName = "ExternalName"
 )
 
 var dnsServiceUUIDToTargetEndpointUUIDs sync.Map
+var serviceUUIDToHostNameAlias sync.Map
 
 // Controller is responsible for monitoring DNSRecord services
 // and populating the endpoint based on target service endpoints.
 // The controller DOES NOT monitor the changes to the target endpoints;
 // that would be handled in the by EndpointController
 type Controller struct {
-	endpoints       v1.EndpointsInterface
-	endpointLister  v1.EndpointsLister
-	namespaceLister v1.NamespaceLister
+	endpoints         v1.EndpointsInterface
+	services          v1.ServiceInterface
+	serviceController v1.ServiceController
+	endpointLister    v1.EndpointsLister
+	serviceLister     v1.ServiceLister
 }
 
 // EndpointController is responsible for monitoring endpoints
@@ -44,27 +51,31 @@ type EndpointController struct {
 
 func Register(ctx context.Context, workload *config.UserOnlyContext) {
 	c := &Controller{
-		endpoints:       workload.Core.Endpoints(""),
-		endpointLister:  workload.Core.Endpoints("").Controller().Lister(),
-		namespaceLister: workload.Core.Namespaces("").Controller().Lister(),
+		endpoints:         workload.Core.Endpoints(""),
+		services:          workload.Core.Services(""),
+		serviceController: workload.Core.Services("").Controller(),
+		endpointLister:    workload.Core.Endpoints("").Controller().Lister(),
+		serviceLister:     workload.Core.Services("").Controller().Lister(),
 	}
 
 	e := &EndpointController{
 		serviceController: workload.Core.Services("").Controller(),
 		serviceLister:     workload.Core.Services("").Controller().Lister(),
 	}
-	workload.Core.Services("").AddHandler("dnsRecordController", c.sync)
-	workload.Core.Endpoints("").AddHandler("dnsRecordEndpointsController", e.reconcileServicesForEndpoint)
+	workload.Core.Services("").AddHandler(ctx, "dnsRecordController", c.sync)
+	workload.Core.Endpoints("").AddHandler(ctx, "dnsRecordEndpointsController", e.reconcileServicesForEndpoint)
 
 }
 
-func (c *Controller) sync(key string, obj *corev1.Service) error {
+func (c *Controller) sync(key string, obj *corev1.Service) (runtime.Object, error) {
 	// no need to handle the remove
 	if obj == nil || obj.DeletionTimestamp != nil {
+		c.queueUpdateForExtNameSvc(key, true)
 		dnsServiceUUIDToTargetEndpointUUIDs.Delete(key)
-		return nil
+		return nil, nil
 	}
-	return c.reconcileEndpoints(key, obj)
+	c.queueUpdateForExtNameSvc(key, false)
+	return nil, c.reconcileEndpoints(key, obj)
 }
 
 func (c *Controller) reconcileEndpoints(key string, obj *corev1.Service) error {
@@ -81,12 +92,18 @@ func (c *Controller) reconcileEndpoints(key string, obj *corev1.Service) error {
 	err := json.Unmarshal([]byte(value), &records)
 	if err != nil {
 		// just log the error, can't really do anything here.
-		logrus.Debugf("Failed to unmarshal targetDnsRecordIds", err)
+		logrus.Debugf("Failed to unmarshal targetDnsRecordIds, error: %v", err)
+		return nil
+	}
+	if records == nil {
 		return nil
 	}
 
 	var newEndpointSubsets []corev1.EndpointSubset
+	var addresses []corev1.EndpointAddress
 	targetEndpointUUIDs := make(map[string]bool)
+	toHandleExternalName := false
+	var externalName string
 	for _, record := range records {
 		groomed := strings.TrimSpace(record)
 		namespaceService := strings.Split(groomed, ":")
@@ -97,6 +114,21 @@ func (c *Controller) reconcileEndpoints(key string, obj *corev1.Service) error {
 		service := namespaceService[1]
 		targetEndpoint, err := c.endpointLister.Get(namespace, service)
 		if err != nil {
+			exists, name, beingDeleted, err := c.checkLinkedSvc(namespace, service, obj.Spec.ExternalName)
+			if err != nil {
+				return errors.Wrapf(err, "Error fetching dns hostName service [%s] in namespace [%s] : %s", service, namespace, err)
+			}
+			aliasExtType := obj.Spec.Type == SvcTypeExternalName
+			if aliasExtType && beingDeleted {
+				logrus.Debugf("Cannot fetch dns hostName service [%s] in namespace [%s] : it is being deleted", service, namespace)
+			}
+			if exists || aliasExtType {
+				toHandleExternalName = true
+				externalName = name
+				svcKey := fmt.Sprintf("%s/%s", namespace, service)
+				serviceUUIDToHostNameAlias.Store(svcKey, key)
+				continue
+			}
 			logrus.Warnf("Failed to fetch endpoints for dns record [%s]: [%v]", groomed, err)
 			continue
 		}
@@ -104,10 +136,54 @@ func (c *Controller) reconcileEndpoints(key string, obj *corev1.Service) error {
 			logrus.Warnf("Failed to fetch endpoints for dns record [%s]: endpoint is being removed", groomed)
 			continue
 		}
-		newEndpointSubsets = append(newEndpointSubsets, targetEndpoint.Subsets...)
+		for _, subset := range targetEndpoint.Subsets {
+			for _, addr := range subset.Addresses {
+				addresses = append(addresses, addr)
+			}
+		}
 		targetEndpointUUID := fmt.Sprintf("%s/%s", targetEndpoint.Namespace, targetEndpoint.Name)
 		targetEndpointUUIDs[targetEndpointUUID] = true
 	}
+
+	var ports []corev1.EndpointPort
+	if len(addresses) > 0 {
+		for _, p := range obj.Spec.Ports {
+			epPort := corev1.EndpointPort{Name: p.Name, Protocol: p.Protocol, Port: p.TargetPort.IntVal}
+			ports = append(ports, epPort)
+		}
+		if len(ports) == 0 {
+			epPort := corev1.EndpointPort{Name: "default", Protocol: corev1.ProtocolTCP, Port: 42}
+			ports = append(ports, epPort)
+		}
+		newEndpointSubsets = append(newEndpointSubsets, corev1.EndpointSubset{
+			Addresses: addresses,
+			Ports:     ports,
+		})
+	}
+
+	if toHandleExternalName {
+		if externalName == "" {
+			logrus.Infof("Deleting dns record [%s] HostName, externalName empty", obj.Name)
+			if err := c.services.DeleteNamespaced(obj.Namespace, obj.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "Error deleting dns record [%s]", obj.Name)
+			}
+		} else if obj.Spec.Type == SvcTypeExternalName &&
+			obj.Spec.ExternalName == externalName &&
+			obj.Spec.ClusterIP == "" {
+			logrus.Infof("HostName dns record [%s] up to date", obj.Name)
+		} else {
+			svcAlias := obj.DeepCopy()
+			svcAlias.Spec.Type = SvcTypeExternalName
+			svcAlias.Spec.ExternalName = externalName
+			svcAlias.Spec.ClusterIP = ""
+			logrus.Infof("Updating HostName of dns record [%s] to %s", obj.Name, externalName)
+			if _, err := c.services.Update(svcAlias); err != nil && !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "Error updating dns record [%s]", obj.Name)
+			}
+		}
+		return nil
+	}
+
 	dnsServiceUUIDToTargetEndpointUUIDs.Store(key, targetEndpointUUIDs)
 
 	ep, err := c.endpointLister.Get(obj.Namespace, obj.Name)
@@ -154,7 +230,7 @@ func (c *Controller) reconcileEndpoints(key string, obj *corev1.Service) error {
 	return nil
 }
 
-func (c *EndpointController) reconcileServicesForEndpoint(key string, obj *corev1.Endpoints) error {
+func (c *EndpointController) reconcileServicesForEndpoint(key string, obj *corev1.Endpoints) (runtime.Object, error) {
 	var dnsRecordServicesToReconcile []string
 	dnsServiceUUIDToTargetEndpointUUIDs.Range(func(k, v interface{}) bool {
 		if _, ok := v.(map[string]bool)[key]; ok {
@@ -170,5 +246,35 @@ func (c *EndpointController) reconcileServicesForEndpoint(key string, obj *corev
 		c.serviceController.Enqueue(namespace, serviceName)
 	}
 
-	return nil
+	return nil, nil
+}
+
+func (c *Controller) queueUpdateForExtNameSvc(key string, delete bool) {
+	alias, ok := serviceUUIDToHostNameAlias.Load(key)
+	if ok && delete {
+		serviceUUIDToHostNameAlias.Delete(key)
+	}
+	if ok {
+		splitted := strings.Split(convert.ToString(alias), "/")
+		namespace := splitted[0]
+		aliasName := splitted[1]
+		c.serviceController.Enqueue(namespace, aliasName)
+	}
+}
+
+func (c *Controller) checkLinkedSvc(namespace string, service string, original string) (bool, string, bool, error) {
+	svc, err := c.serviceLister.Get(namespace, service)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, "", false, nil
+		}
+		return false, "", false, err
+	}
+	if svc.Spec.Type == SvcTypeExternalName {
+		if svc.DeletionTimestamp != nil {
+			return true, "", true, nil
+		}
+		return true, svc.Spec.ExternalName, false, nil
+	}
+	return false, original, false, nil
 }

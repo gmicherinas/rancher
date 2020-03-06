@@ -9,7 +9,8 @@ import (
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/rancher/pkg/auth/providers/common"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/auth/tokens"
+	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/apis/management.cattle.io/v3public"
 	"github.com/rancher/types/config"
 	"github.com/sirupsen/logrus"
@@ -28,15 +29,17 @@ const (
 	searchIndexDefaultLen = 6
 )
 
-type lProvider struct {
+type Provider struct {
 	userLister   v3.UserLister
 	groupLister  v3.GroupLister
 	userIndexer  cache.Indexer
 	gmIndexer    cache.Indexer
 	groupIndexer cache.Indexer
+	tokenMGR     *tokens.Manager
+	invalidHash  []byte
 }
 
-func Configure(ctx context.Context, mgmtCtx *config.ScaledContext) common.AuthProvider {
+func Configure(ctx context.Context, mgmtCtx *config.ScaledContext, tokenMGR *tokens.Manager) common.AuthProvider {
 	informer := mgmtCtx.Management.Users("").Controller().Informer()
 	indexers := map[string]cache.IndexFunc{userNameIndex: userNameIndexer, userSearchIndex: userSearchIndexer}
 	informer.AddIndexers(indexers)
@@ -49,56 +52,73 @@ func Configure(ctx context.Context, mgmtCtx *config.ScaledContext) common.AuthPr
 	gIndexers := map[string]cache.IndexFunc{groupSearchIndex: groupSearchIndexer}
 	gInformer.AddIndexers(gIndexers)
 
-	l := &lProvider{
+	invalidHash, _ := bcrypt.GenerateFromPassword([]byte("invalid"), bcrypt.DefaultCost)
+
+	l := &Provider{
 		userIndexer:  informer.GetIndexer(),
 		gmIndexer:    gmInformer.GetIndexer(),
 		groupLister:  mgmtCtx.Management.Groups("").Controller().Lister(),
 		groupIndexer: gInformer.GetIndexer(),
 		userLister:   mgmtCtx.Management.Users("").Controller().Lister(),
+		tokenMGR:     tokenMGR,
+		invalidHash:  invalidHash,
 	}
 	return l
 }
 
-func (l *lProvider) GetName() string {
+func (l *Provider) GetName() string {
 	return Name
 }
 
-func (l *lProvider) CustomizeSchema(schema *types.Schema) {
+func (l *Provider) CustomizeSchema(schema *types.Schema) {
 	schema.ActionHandler = l.actionHandler
 }
 
-func (l *lProvider) TransformToAuthProvider(authConfig map[string]interface{}) map[string]interface{} {
-	return common.TransformToAuthProvider(authConfig)
+func (l *Provider) TransformToAuthProvider(authConfig map[string]interface{}) (map[string]interface{}, error) {
+	return common.TransformToAuthProvider(authConfig), nil
 }
 
-func (l *lProvider) AuthenticateUser(input interface{}) (v3.Principal, []v3.Principal, map[string]string, error) {
+func (l *Provider) getUser(username string) (*v3.User, error) {
+	objs, err := l.userIndexer.ByIndex(userNameIndex, username)
+
+	if err != nil {
+		return nil, err
+	}
+	if len(objs) == 0 {
+		return nil, httperror.WrapAPIError(err, httperror.Unauthorized, "authentication failed")
+	}
+	if len(objs) > 1 {
+		return nil, fmt.Errorf("found more than one users with username %v", username)
+	}
+
+	user, ok := objs[0].(*v3.User)
+
+	if !ok {
+		return nil, fmt.Errorf("fatal error. %v is not a user", objs[0])
+	}
+	return user, nil
+}
+
+func (l *Provider) AuthenticateUser(ctx context.Context, input interface{}) (v3.Principal, []v3.Principal, string, error) {
 	localInput, ok := input.(*v3public.BasicLogin)
 	if !ok {
-		return v3.Principal{}, nil, nil, httperror.NewAPIError(httperror.ServerError, "Unexpected input type")
+		return v3.Principal{}, nil, "", httperror.NewAPIError(httperror.ServerError, "Unexpected input type")
 	}
 
 	username := localInput.Username
 	pwd := localInput.Password
 
-	objs, err := l.userIndexer.ByIndex(userNameIndex, username)
+	user, err := l.getUser(username)
+
 	if err != nil {
-		return v3.Principal{}, nil, nil, err
-	}
-	if len(objs) == 0 {
-		return v3.Principal{}, nil, nil, httperror.WrapAPIError(err, httperror.Unauthorized, "authentication failed")
-	}
-	if len(objs) > 1 {
-		return v3.Principal{}, nil, nil, fmt.Errorf("found more than one users with username %v", username)
-	}
-
-	user, ok := objs[0].(*v3.User)
-	if !ok {
-		return v3.Principal{}, nil, nil, fmt.Errorf("fatal error. %v is not a user", objs[0])
-
+		// If the user don't exist the password is evaluated
+		// to avoid user enumeration via timing attack (time based side-channel).
+		bcrypt.CompareHashAndPassword(l.invalidHash, []byte(pwd))
+		return v3.Principal{}, nil, "", err
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(pwd)); err != nil {
-		return v3.Principal{}, nil, nil, httperror.WrapAPIError(err, httperror.Unauthorized, "authentication failed")
+		return v3.Principal{}, nil, "", httperror.WrapAPIError(err, httperror.Unauthorized, "authentication failed")
 	}
 
 	principalID := getLocalPrincipalID(user)
@@ -107,10 +127,10 @@ func (l *lProvider) AuthenticateUser(input interface{}) (v3.Principal, []v3.Prin
 
 	groupPrincipals, err := l.getGroupPrincipals(user)
 	if err != nil {
-		return v3.Principal{}, nil, nil, errors.Wrapf(err, "failed to get groups for %v", user.ObjectMeta.Name)
+		return v3.Principal{}, nil, "", errors.Wrapf(err, "failed to get groups for %v", user.Name)
 	}
 
-	return userPrincipal, groupPrincipals, map[string]string{}, nil
+	return userPrincipal, groupPrincipals, "", nil
 }
 
 func getLocalPrincipalID(user *v3.User) string {
@@ -124,7 +144,7 @@ func getLocalPrincipalID(user *v3.User) string {
 	return principalID
 }
 
-func (l *lProvider) getGroupPrincipals(user *v3.User) ([]v3.Principal, error) {
+func (l *Provider) getGroupPrincipals(user *v3.User) ([]v3.Principal, error) {
 	groupPrincipals := []v3.Principal{}
 
 	for _, pid := range user.PrincipalIDs {
@@ -155,7 +175,27 @@ func (l *lProvider) getGroupPrincipals(user *v3.User) ([]v3.Principal, error) {
 	return groupPrincipals, nil
 }
 
-func (l *lProvider) SearchPrincipals(searchKey, principalType string, myToken v3.Token) ([]v3.Principal, error) {
+func (l *Provider) RefetchGroupPrincipals(principalID string, secret string) ([]v3.Principal, error) {
+	userID := strings.SplitN(principalID, "://", 2)[1]
+	user, err := l.userLister.Get("", userID)
+	if err != nil {
+		return nil, err
+	}
+
+	return l.getGroupPrincipals(user)
+}
+
+func (l *Provider) SearchPrincipals(searchKey, principalType string, token v3.Token) ([]v3.Principal, error) {
+	return l.SearchPrincipalsDedupe(searchKey, principalType, token, nil)
+}
+
+// SearchPrincipalsDedupe performs principal search, but deduplicates the results against the supplied list (that should have come from other non-local auth providers)
+// This is to avoid getting duplicate search results
+func (l *Provider) SearchPrincipalsDedupe(searchKey, principalType string, token v3.Token, principalsFromOtherProviders []v3.Principal) ([]v3.Principal, error) {
+	fromOtherProviders := map[string]bool{}
+	for _, p := range principalsFromOtherProviders {
+		fromOtherProviders[p.Name] = true
+	}
 	var principals []v3.Principal
 	var localUsers []*v3.User
 	var localGroups []*v3.Group
@@ -173,16 +213,22 @@ func (l *lProvider) SearchPrincipals(searchKey, principalType string, myToken v3
 	}
 
 	if principalType == "" || principalType == "user" {
+	User:
 		for _, user := range localUsers {
+			for _, p := range user.PrincipalIDs {
+				if fromOtherProviders[p] {
+					continue User
+				}
+			}
 			principalID := getLocalPrincipalID(user)
-			userPrincipal := l.toPrincipal("user", user.DisplayName, user.Username, principalID, &myToken)
+			userPrincipal := l.toPrincipal("user", user.DisplayName, user.Username, principalID, &token)
 			principals = append(principals, userPrincipal)
 		}
 	}
 
 	if principalType == "" || principalType == "group" {
 		for _, group := range localGroups {
-			groupPrincipal := l.toPrincipal("group", group.DisplayName, "", Name+"://"+group.Name, &myToken)
+			groupPrincipal := l.toPrincipal("group", group.DisplayName, "", Name+"://"+group.Name, &token)
 			principals = append(principals, groupPrincipal)
 		}
 	}
@@ -190,7 +236,7 @@ func (l *lProvider) SearchPrincipals(searchKey, principalType string, myToken v3
 	return principals, nil
 }
 
-func (l *lProvider) toPrincipal(principalType, displayName, loginName, id string, token *v3.Token) v3.Principal {
+func (l *Provider) toPrincipal(principalType, displayName, loginName, id string, token *v3.Token) v3.Principal {
 	if displayName == "" {
 		displayName = loginName
 	}
@@ -211,14 +257,14 @@ func (l *lProvider) toPrincipal(principalType, displayName, loginName, id string
 	} else {
 		princ.PrincipalType = "group"
 		if token != nil {
-			princ.MemberOf = l.isMemberOf(token.GroupPrincipals, princ)
+			princ.MemberOf = l.tokenMGR.IsMemberOf(*token, princ)
 		}
 	}
 
 	return princ
 }
 
-func (l *lProvider) GetPrincipal(principalID string, token v3.Token) (v3.Principal, error) {
+func (l *Provider) GetPrincipal(principalID string, token v3.Token) (v3.Principal, error) {
 	// TODO implement group lookup (local groups currently not implemented, so we can skip)
 	// parsing id to get the external id and type. id looks like github_[user|org|team]://12345
 	var name string
@@ -238,7 +284,7 @@ func (l *lProvider) GetPrincipal(principalID string, token v3.Token) (v3.Princip
 	return princ, nil
 }
 
-func (l *lProvider) listAllUsersAndGroups(searchKey string) ([]*v3.User, []*v3.Group, error) {
+func (l *Provider) listAllUsersAndGroups(searchKey string) ([]*v3.User, []*v3.Group, error) {
 	var localUsers []*v3.User
 	var localGroups []*v3.Group
 
@@ -268,7 +314,7 @@ func (l *lProvider) listAllUsersAndGroups(searchKey string) ([]*v3.User, []*v3.G
 	return localUsers, localGroups, err
 }
 
-func (l *lProvider) listUsersAndGroupsByIndex(searchKey string) ([]*v3.User, []*v3.Group, error) {
+func (l *Provider) listUsersAndGroupsByIndex(searchKey string) ([]*v3.User, []*v3.Group, error) {
 	var localUsers []*v3.User
 	var localGroups []*v3.Group
 	var err error
@@ -306,7 +352,7 @@ func (l *lProvider) listUsersAndGroupsByIndex(searchKey string) ([]*v3.User, []*
 
 }
 
-func (l *lProvider) isThisUserMe(me v3.Principal, other v3.Principal) bool {
+func (l *Provider) isThisUserMe(me v3.Principal, other v3.Principal) bool {
 
 	if me.ObjectMeta.Name == other.ObjectMeta.Name && me.LoginName == other.LoginName && me.PrincipalType == other.PrincipalType {
 		return true
@@ -314,17 +360,7 @@ func (l *lProvider) isThisUserMe(me v3.Principal, other v3.Principal) bool {
 	return false
 }
 
-func (l *lProvider) isMemberOf(myGroups []v3.Principal, other v3.Principal) bool {
-
-	for _, mygroup := range myGroups {
-		if mygroup.ObjectMeta.Name == other.ObjectMeta.Name && mygroup.PrincipalType == other.PrincipalType {
-			return true
-		}
-	}
-	return false
-}
-
-func (l *lProvider) actionHandler(actionName string, action *types.Action, request *types.APIContext) error {
+func (l *Provider) actionHandler(actionName string, action *types.Action, request *types.APIContext) error {
 	return httperror.NewAPIError(httperror.ActionNotAvailable, "")
 }
 
@@ -384,4 +420,24 @@ func indexField(field string, maxindex int) []string {
 		fieldIndexes = append(fieldIndexes, field[0:i])
 	}
 	return fieldIndexes
+}
+
+func (l *Provider) CanAccessWithGroupProviders(userPrincipalID string, groupPrincipals []v3.Principal) (bool, error) {
+	userID := strings.TrimPrefix(userPrincipalID, Name+"://")
+	user, err := l.userLister.Get("", userID)
+	if err != nil {
+		return false, err
+	}
+
+	if user.Username != "" {
+		return true, nil
+	}
+
+	for _, principalID := range user.PrincipalIDs {
+		if strings.HasPrefix(principalID, "system://") {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

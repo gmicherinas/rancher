@@ -2,17 +2,28 @@ package v3
 
 import (
 	"github.com/rancher/norman/lifecycle"
+	"github.com/rancher/norman/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 type GlobalRoleLifecycle interface {
-	Create(obj *GlobalRole) (*GlobalRole, error)
-	Remove(obj *GlobalRole) (*GlobalRole, error)
-	Updated(obj *GlobalRole) (*GlobalRole, error)
+	Create(obj *GlobalRole) (runtime.Object, error)
+	Remove(obj *GlobalRole) (runtime.Object, error)
+	Updated(obj *GlobalRole) (runtime.Object, error)
 }
 
 type globalRoleLifecycleAdapter struct {
 	lifecycle GlobalRoleLifecycle
+}
+
+func (w *globalRoleLifecycleAdapter) HasCreate() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasCreate()
+}
+
+func (w *globalRoleLifecycleAdapter) HasFinalize() bool {
+	o, ok := w.lifecycle.(lifecycle.ObjectLifecycleCondition)
+	return !ok || o.HasFinalize()
 }
 
 func (w *globalRoleLifecycleAdapter) Create(obj runtime.Object) (runtime.Object, error) {
@@ -40,12 +51,16 @@ func (w *globalRoleLifecycleAdapter) Updated(obj runtime.Object) (runtime.Object
 }
 
 func NewGlobalRoleLifecycleAdapter(name string, clusterScoped bool, client GlobalRoleInterface, l GlobalRoleLifecycle) GlobalRoleHandlerFunc {
+	if clusterScoped {
+		resource.PutClusterScoped(GlobalRoleGroupVersionResource)
+	}
 	adapter := &globalRoleLifecycleAdapter{lifecycle: l}
 	syncFn := lifecycle.NewObjectLifecycleAdapter(name, clusterScoped, adapter, client.ObjectClient())
-	return func(key string, obj *GlobalRole) error {
-		if obj == nil {
-			return syncFn(key, nil)
+	return func(key string, obj *GlobalRole) (runtime.Object, error) {
+		newObj, err := syncFn(key, obj)
+		if o, ok := newObj.(runtime.Object); ok {
+			return o, err
 		}
-		return syncFn(key, obj)
+		return nil, err
 	}
 }

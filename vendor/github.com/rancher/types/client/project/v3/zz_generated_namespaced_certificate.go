@@ -27,7 +27,7 @@ const (
 	NamespacedCertificateFieldRemoved                 = "removed"
 	NamespacedCertificateFieldSerialNumber            = "serialNumber"
 	NamespacedCertificateFieldSubjectAlternativeNames = "subjectAlternativeNames"
-	NamespacedCertificateFieldUuid                    = "uuid"
+	NamespacedCertificateFieldUUID                    = "uuid"
 	NamespacedCertificateFieldVersion                 = "version"
 )
 
@@ -54,9 +54,10 @@ type NamespacedCertificate struct {
 	Removed                 string            `json:"removed,omitempty" yaml:"removed,omitempty"`
 	SerialNumber            string            `json:"serialNumber,omitempty" yaml:"serialNumber,omitempty"`
 	SubjectAlternativeNames []string          `json:"subjectAlternativeNames,omitempty" yaml:"subjectAlternativeNames,omitempty"`
-	Uuid                    string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
+	UUID                    string            `json:"uuid,omitempty" yaml:"uuid,omitempty"`
 	Version                 string            `json:"version,omitempty" yaml:"version,omitempty"`
 }
+
 type NamespacedCertificateCollection struct {
 	types.Collection
 	Data   []NamespacedCertificate `json:"data,omitempty"`
@@ -69,8 +70,10 @@ type NamespacedCertificateClient struct {
 
 type NamespacedCertificateOperations interface {
 	List(opts *types.ListOpts) (*NamespacedCertificateCollection, error)
+	ListAll(opts *types.ListOpts) (*NamespacedCertificateCollection, error)
 	Create(opts *NamespacedCertificate) (*NamespacedCertificate, error)
 	Update(existing *NamespacedCertificate, updates interface{}) (*NamespacedCertificate, error)
+	Replace(existing *NamespacedCertificate) (*NamespacedCertificate, error)
 	ByID(id string) (*NamespacedCertificate, error)
 	Delete(container *NamespacedCertificate) error
 }
@@ -93,10 +96,34 @@ func (c *NamespacedCertificateClient) Update(existing *NamespacedCertificate, up
 	return resp, err
 }
 
+func (c *NamespacedCertificateClient) Replace(obj *NamespacedCertificate) (*NamespacedCertificate, error) {
+	resp := &NamespacedCertificate{}
+	err := c.apiClient.Ops.DoReplace(NamespacedCertificateType, &obj.Resource, obj, resp)
+	return resp, err
+}
+
 func (c *NamespacedCertificateClient) List(opts *types.ListOpts) (*NamespacedCertificateCollection, error) {
 	resp := &NamespacedCertificateCollection{}
 	err := c.apiClient.Ops.DoList(NamespacedCertificateType, opts, resp)
 	resp.client = c
+	return resp, err
+}
+
+func (c *NamespacedCertificateClient) ListAll(opts *types.ListOpts) (*NamespacedCertificateCollection, error) {
+	resp := &NamespacedCertificateCollection{}
+	resp, err := c.List(opts)
+	if err != nil {
+		return resp, err
+	}
+	data := resp.Data
+	for next, err := resp.Next(); next != nil && err == nil; next, err = next.Next() {
+		data = append(data, next.Data...)
+		resp = next
+		resp.Data = data
+	}
+	if err != nil {
+		return resp, err
+	}
 	return resp, err
 }
 
